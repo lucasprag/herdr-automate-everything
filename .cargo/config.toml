@@ -1,0 +1,3 @@
+[build]
+# Hidden, so Herdr's mod hot-reload ignores build churn.
+target-dir = ".target"
