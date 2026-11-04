@@ -10,6 +10,7 @@ mod proc;
 mod runner;
 mod scheduler;
 mod service;
+mod tabs;
 
 use std::io::IsTerminal;
 
@@ -94,6 +95,11 @@ enum Cmd {
     Service {
         #[command(subcommand)]
         action: service::Action,
+    },
+    /// Tabs a run opens in its own space for helper work, and closes again
+    Tab {
+        #[command(subcommand)]
+        action: tabs::Action,
     },
     /// Run the scheduler in the foreground (launchd does this)
     Scheduler,
@@ -498,6 +504,7 @@ fn main() -> Result<()> {
         Cmd::Check { json } => check(json),
         Cmd::Status { json } => status(json),
         Cmd::Service { action } => service::run(action),
+        Cmd::Tab { action } => tabs::run(action),
         Cmd::Scheduler => scheduler::serve(),
         Cmd::RunInternal { name, run_id, trigger, scheduled_for, caught_up } => {
             let trigger = match trigger.as_str() {

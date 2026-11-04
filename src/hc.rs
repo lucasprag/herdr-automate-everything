@@ -268,6 +268,38 @@ pub fn name_space_and_tab(
     })
 }
 
+/// Names a tab in an existing space, adding it to the document when the app
+/// hasn't yet. Leaves the space's own name alone.
+pub fn name_tab(space_id: &str, tab_id: &str, tab_name: &str, terminal: &str) -> Result<()> {
+    doc_update(|doc| {
+        let Some(list) = doc["spaces"].as_array_mut() else { bail!("no space {space_id} in the app's document") };
+        let Some(space) = list.iter_mut().find(|s| s["id"] == space_id) else {
+            bail!("no space {space_id} in the app's document")
+        };
+        if !space["tabs"].is_array() {
+            space["tabs"] = json!([]);
+        }
+        let tabs = space["tabs"].as_array_mut().unwrap();
+        match tabs.iter_mut().find(|t| t["id"] == tab_id) {
+            Some(t) if t["name"].as_str() == Some(tab_name) => Ok(false),
+            Some(t) => {
+                t["name"] = json!(tab_name);
+                Ok(true)
+            }
+            None => {
+                tabs.push(json!({
+                    "id": tab_id,
+                    "name": tab_name,
+                    "root": { "type": "row", "id": tab_id, "children": [
+                        { "type": "block", "id": new_id("p"), "content": { "terminal": terminal } }
+                    ] }
+                }));
+                Ok(true)
+            }
+        }
+    })
+}
+
 /// Drops a tab (and its space, when it was the last) from the document,
 /// for when the app isn't running to notice its terminals ended.
 pub fn forget_tab(space_id: &str, tab_id: &str) -> Result<()> {
