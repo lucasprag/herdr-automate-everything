@@ -51,8 +51,8 @@ Terminology:
 
 The panel follows Orca's automations interface: a home page and a history page.
 
-20. **Home page: every automation**, scripts included, one line each with its name, status (`active`, `paused` or `running`), last run (when, and how it ended) and next run. Run history is not on this page.
-21. **A `...` menu on each line** with Run now, Edit, Pause or Resume (whichever applies) and Delete. Delete asks for confirmation, removes the entry from the config file and deletes its run history, as Orca's `remove` does.
+20. **Home page: every automation**, scripts included, one line each with its name, status (`active`, `paused` or `running`), last run (when, and how it ended) and next run. Run history is not on this page. Dragging a line by its handle moves it up or down; the new order is written to the config file, which keeps entries in the order shown.
+21. **Actions on each line:** a play button (Run now) and a pause button (Pause; drawn pressed while paused, and clicking it then resumes), plus a `...` menu with Edit and Delete. Delete asks for confirmation, removes the entry from the config file and deletes its run history, as Orca's `remove` does.
 22. **Edit opens a form** for the entry's fields. Saving writes back to the config file and changes only that entry: comments, order and every other entry are left as they were. An invalid value is refused in the form, not written.
 23. **A History button on the home page** opens the history page.
 24. **History page: a log of runs**, newest first, across all automations. One record per fire or run with the automation, trigger (`scheduled` or `manual`), status (`succeeded`, `failed`, `blocked`, `skipped_precheck`, `skipped_overlap`, `missed`) and times. Opening a record shows the precheck result and the run's output; for a blocked run, it jumps to its space. Agent output is captured before the space or tab closes. Skips live in the same log as runs, so "ran and found nothing" is distinguishable from "never fired". No notifications, no read or unread state.

@@ -419,6 +419,37 @@ pub fn set_paused(name: &str, paused: bool) -> Result<()> {
     })
 }
 
+/// Moves an entry to `to` (1-based) in the list; the panel and `list` show
+/// entries in file order.
+pub fn move_to(name: &str, to: usize) -> Result<()> {
+    edit(name, |doc| reorder(doc, name, to))
+}
+
+/// Each entry's table, with the comments above its header, takes the slot of
+/// the entry it lands on, so anything else in the file stays where it is.
+fn reorder(doc: &mut toml_edit::DocumentMut, name: &str, to: usize) -> Result<()> {
+    let autos = automations_table(doc)?;
+    let mut entries: Vec<(String, isize)> = autos
+        .iter()
+        .enumerate()
+        .map(|(i, (k, v))| (k.to_string(), v.as_table().and_then(|t| t.position()).unwrap_or(isize::MAX - 1000 + i as isize)))
+        .collect();
+    entries.sort_by_key(|(_, p)| *p);
+    let slots: Vec<isize> = entries.iter().map(|(_, p)| *p).collect();
+    let mut names: Vec<String> = entries.into_iter().map(|(k, _)| k).collect();
+    let from = names.iter().position(|n| n == name).ok_or_else(|| anyhow!("no automation named `{name}`"))?;
+    let moved = names.remove(from);
+    names.insert(to.clamp(1, names.len() + 1) - 1, moved);
+    for (n, slot) in names.iter().zip(&slots) {
+        if let Some(t) = autos.get_mut(n).and_then(|i| i.as_table_mut()) {
+            t.set_position(*slot);
+        }
+    }
+    let rank = |k: &str| names.iter().position(|n| n == k).unwrap_or(usize::MAX);
+    autos.sort_values_by(|a, _, b, _| rank(a.get()).cmp(&rank(b.get())));
+    Ok(())
+}
+
 pub fn remove(name: &str) -> Result<()> {
     edit(name, |doc| {
         automations_table(doc)?
@@ -512,6 +543,23 @@ pub fn upsert(name: &str, fields: &serde_json::Map<String, serde_json::Value>, c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reorder_moves_tables_with_their_comments() {
+        let text = "# header\n\n[settings]\nretention_days = 3\n\n# about a\n[automations.a]\nkind = \"script\"\n\n[automations.b]\nkind = \"script\"\n\n# about c\n[automations.c]\nkind = \"script\"\n";
+        let mut doc: toml_edit::DocumentMut = text.parse().unwrap();
+        reorder(&mut doc, "c", 1).unwrap();
+        let out = doc.to_string();
+        assert_eq!(
+            out,
+            "# header\n\n[settings]\nretention_days = 3\n\n# about c\n[automations.c]\nkind = \"script\"\n\n# about a\n[automations.a]\nkind = \"script\"\n\n[automations.b]\nkind = \"script\"\n"
+        );
+        let mut doc: toml_edit::DocumentMut = out.parse().unwrap();
+        reorder(&mut doc, "c", 99).unwrap();
+        let order: Vec<_> = doc["automations"].as_table().unwrap().iter().map(|(k, _)| k.to_string()).collect();
+        assert_eq!(order, ["a", "b", "c"]);
+        assert!(doc.to_string().ends_with("# about c\n[automations.c]\nkind = \"script\"\n"));
+    }
 
     #[test]
     fn invalid_entry_does_not_hide_others() {

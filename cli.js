@@ -43,5 +43,6 @@ export const runNow = (name) => json(["run", name, "--json"]);
 export const pause = (name) => call(["pause", name]);
 export const resume = (name) => call(["resume", name]);
 export const remove = (name) => call(["delete", name, "--yes"]);
+export const move = (name, to) => call(["move", name, "--to", String(to)]);
 export const save = (name, fields, create) =>
   call(["set", name, "--fields", JSON.stringify(fields), ...(create ? ["--create"] : [])]);

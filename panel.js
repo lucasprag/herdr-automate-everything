@@ -28,6 +28,9 @@ export class Panel {
     this.scheduler = null;
     this.busy = false;
     this.install = null; // { ok, log } from install.sh's last run
+    this.drag = null; // a row being dragged to a new place
+    this.heights = new Map(); // row heights by name, for working out where a drag lands
+    this.noClickUntil = 0;
     // Self-install: build if src/ changed, put the binary in ~/.local/bin,
     // keep the launchd agent running. Cheap when nothing changed.
     this.selfInstall(cx);
@@ -171,6 +174,7 @@ export class Panel {
   banner(t) {
     const notRunning = this.scheduler && !this.scheduler.scheduler_running;
     const text = this.error
+      ?? this.actionError
       ?? (this.install && !this.install.ok ? `Couldn't install the scheduler: ${this.install.log} (see mods/automate-everything/.target/install.log)` : null)
       ?? (notRunning ? "Starting the scheduler…" : null);
     if (!text) return null;
@@ -191,31 +195,99 @@ export class Panel {
       .child(div().size(7).rounded(4).when(status === "paused", (el) => el.border_1().border_color(color)).when(status !== "paused", (el) => el.bg(color)));
   }
 
+  // The handle an automation is dragged by. The press stays here, so the
+  // line's own click (open its history) never fires from it.
+  grip(t, name, dragged) {
+    return div().id(`ae-grip-${name}`).w(12).h(20).flex_none().flex().items_center().justify_center()
+      .text_color(dragged ? t.foreground : t.dim)
+      .when(dragged, (el) => el.cursor_grabbing())
+      .when(!dragged, (el) => el.cursor_grab().hover((s) => s.text_color(t.foreground)))
+      .tooltip("Drag to reorder")
+      .on_mouse_down("left", (e, cx) => {
+        cx.stop_propagation();
+        this.pressRow(name, e);
+      })
+      // Released on the handle itself: the list never hears it, so finish here.
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        if (this.drag?.moved) this.drop(cx);
+        else this.drag = null;
+      })
+      .child(svg(`${ICON}/grip.svg`).size(12));
+  }
+
+  // A small icon button on an automation's line. `onClick` null draws it
+  // dimmed and inert; `on` draws it pressed (the pause button while paused).
+  rowButton(t, id, icon, size, tip, onClick, opts = {}) {
+    const el = div().id(id).size(22).flex_none().flex().items_center().justify_center().tooltip(tip)
+      .text_color(opts.on ? t.accent : t.dim)
+      .when(Boolean(opts.on), (el) => el.bg(t.selected))
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        onClick?.(cx);
+      })
+      // A press on a button is never the start of a drag.
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .child(svg(`${ICON}/${icon}`).size(size));
+    return onClick
+      ? el.when(!this.drag?.moved, (el) => el.cursor_pointer()).hover((s) => s.bg(t.selected).text_color(t.foreground))
+      : el.opacity(0.35);
+  }
+
+  // Run, pause or resume one automation; the list follows the files changing.
+  act(name, fn, cx) {
+    this.acting ??= new Set();
+    if (this.acting.has(name)) return;
+    this.acting.add(name);
+    this.actionError = null;
+    cx.spawn(async (cx) => {
+      try {
+        await fn();
+      } catch (e) {
+        this.actionError = `${name}: ${String(e?.message ?? e)}`;
+      }
+      this.acting.delete(name);
+      this.refresh(cx);
+    });
+  }
+
   itemRow(t, item) {
     const status = this.statusOf(item);
     const last = item.last;
     const lastText = last ? `${word(last.status)} ${ago(when(last))}` : "never ran";
     const next = item.next && status !== "paused" ? `next ${clock(item.next)}` : "";
-    return v_flex().id(`ae-item-${item.name}`).px(16).py(8).gap(3).flex_none().cursor_pointer()
+    const dragged = Boolean(this.drag?.moved && this.drag.name === item.name);
+    return v_flex().id(`ae-item-${item.name}`).pl(6).pr(16).py(8).gap(3).flex_none()
+      // Mid-drag the list's grabbing cursor shows over every line.
+      .when(!this.drag?.moved, (el) => el.cursor_pointer())
       .border_b(1).border_color(t.border)
-      .hover((s) => s.bg(t.hover))
-      .on_click((_e, cx) => this.go("history", cx, { filter: item.name }))
+      .when(dragged, (el) => el.bg(t.selected))
+      .when(!this.drag?.moved, (el) => el.hover((s) => s.bg(t.hover)))
+      .on_size_change((size) => this.heights.set(item.name, size.height))
+      .on_click((_e, cx) => {
+        if (this.drag?.moved || Date.now() < this.noClickUntil) return;
+        this.go("history", cx, { filter: item.name });
+      })
       .child(h_flex().gap(8).items_center()
-        .child(this.mark(t, status))
+        .child(h_flex().gap(4).flex_none().items_center().child(this.grip(t, item.name, dragged)).child(this.mark(t, status)))
         .child(div().flex_1().min_w(0).truncate().text_size(12.8).text_color(t.foreground).child(item.name))
         .child(div().flex_none().text_size(11.5).text_color(t.dim).child(next))
-        .child(div().id(`ae-more-${item.name}`).size(22).flex_none().flex().items_center().justify_center().text_color(t.dim)
-          .hover((s) => s.bg(t.selected).text_color(t.foreground))
-          .on_click((_e, cx) => {
-            cx.stop_propagation();
-            openOverlay(menuSpec(item));
-          })
-          .child(svg(`${ICON}/dots.svg`).size(14))))
-      .child(h_flex().pl(20).gap(6).items_center().text_size(11.5)
+        .children(status === "invalid" ? [] : [
+          this.rowButton(t, `ae-run-now-${item.name}`, "play.svg", 11,
+            status === "running" ? "Running" : "Run now",
+            status === "running" ? null : (cx) => this.act(item.name, () => cli.runNow(item.name), cx)),
+          this.rowButton(t, `ae-pause-${item.name}`, "pause.svg", 11,
+            item.paused ? "Paused: click to resume" : "Pause",
+            (cx) => this.act(item.name, () => (item.paused ? cli.resume : cli.pause)(item.name), cx),
+            { on: item.paused }),
+        ])
+        .child(this.rowButton(t, `ae-more-${item.name}`, "dots.svg", 14, "Edit or delete",
+          () => openOverlay(menuSpec(item)))))
+      .child(h_flex().pl(36).gap(6).items_center().text_size(11.5)
         .child(div().flex_none().text_color(tone(t, status)).child(status))
         .child(div().flex_none().text_color(t.dim).child(`· ${item.kind ?? "?"} ·`))
         .child(div().flex_1().min_w(0).truncate().text_color(last ? tone(t, last.status) : t.dim).child(lastText)))
-      .when(Boolean(item.error), (el) => el.child(div().pl(20).text_size(11.5).text_color(t.blocked).child(item.error)));
+      .when(Boolean(item.error), (el) => el.child(div().pl(36).text_size(11.5).text_color(t.blocked).child(item.error)));
   }
 
   home(t) {
@@ -225,7 +297,77 @@ export class Panel {
         .child("No automations yet.")
         .child("Add one with + or in ~/.config/automate-everything/automations.toml.");
     }
-    return v_flex().id("ae-list").flex_1().min_h(0).overflow_y_scrollbar().children(this.items.map((i) => this.itemRow(t, i)));
+    return v_flex().id("ae-list").flex_1().min_h(0).overflow_y_scrollbar()
+      .when(Boolean(this.drag?.moved), (el) => el.cursor_grabbing())
+      .on_mouse_move((e, cx) => this.dragTo(e, cx))
+      .on_mouse_up("left", (_e, cx) => this.drop(cx))
+      // Nothing reports a release outside the list, so leaving it cancels.
+      .on_hover((hovered, cx) => {
+        if (!hovered && this.drag) {
+          this.drag = null;
+          cx.notify();
+        }
+      })
+      .children(this.ordered().map((i) => this.itemRow(t, i)));
+  }
+
+  // ---- dragging to reorder ---------------------------------------------
+  // A press on a line's handle arms a drag; moving 4px starts it. The list shows the
+  // new order live, and the release writes it with `automate-everything move`.
+
+  pressRow(name, e) {
+    const from = this.items?.findIndex((i) => i.name === name) ?? -1;
+    const height = this.heights.get(name);
+    if (from < 0 || !height) return;
+    const above = this.items.slice(0, from).reduce((sum, i) => sum + (this.heights.get(i.name) ?? height), 0);
+    this.drag = { name, from, to: from, startY: e.position.y, rowTop: above, height, moved: false };
+  }
+
+  dragTo(e, cx) {
+    const d = this.drag;
+    if (!d) return;
+    const dy = e.position.y - d.startY;
+    if (!d.moved && Math.abs(dy) < 4) return;
+    const first = !d.moved;
+    d.moved = true;
+    // The dragged row's middle, in list coordinates, against the middles of
+    // the other rows laid out without it.
+    const middle = d.rowTop + d.height / 2 + dy;
+    let y = 0;
+    let to = 0;
+    for (const i of this.items) {
+      if (i.name === d.name) continue;
+      const h = this.heights.get(i.name) ?? d.height;
+      if (y + h / 2 < middle) to++;
+      y += h;
+    }
+    if (first || to !== d.to) {
+      d.to = to;
+      cx.notify();
+    }
+  }
+
+  drop(cx) {
+    const d = this.drag;
+    this.drag = null;
+    if (!d?.moved) return;
+    this.noClickUntil = Date.now() + 300;
+    const from = this.items.findIndex((i) => i.name === d.name);
+    if (from >= 0 && d.to !== from) {
+      this.items = this.ordered({ ...d, from });
+      this.act(d.name, () => cli.move(d.name, d.to + 1), cx);
+    }
+    cx.notify();
+  }
+
+  // The items in the order on screen: mid-drag, the dragged one at its new place.
+  ordered(d = this.drag) {
+    if (!d?.moved || !this.items) return this.items ?? [];
+    const rest = this.items.filter((i) => i.name !== d.name);
+    const item = this.items.find((i) => i.name === d.name);
+    if (!item) return this.items;
+    rest.splice(d.to, 0, item);
+    return rest;
   }
 
   // ---- history ----------------------------------------------------------
@@ -332,7 +474,7 @@ export class Panel {
 
 function menuSpec(item) {
   return { frame: "none", mod: "automate-everything", kind: "popup", width: 180,
-    props: { view: "menu", name: item.name, paused: item.paused, invalid: item.status === "invalid" } };
+    props: { view: "menu", name: item.name } };
 }
 
 export function editSpec(name) {

@@ -1,4 +1,4 @@
-// The panel's popups: the `...` menu on each automation, and the delete
+// The panel's popups: the `...` menu on each automation (edit, delete), and the delete
 // confirmation. Both act through the CLI and close; the panel follows the
 // files changing.
 
@@ -12,21 +12,8 @@ const frame = (t) => v_flex().bg(t.popover).border_1().border_color(t.border).sh
 
 export class Menu {
   init(cx) {
-    this.error = null;
     this.handle = cx.focus_handle();
     this.handle.focus();
-  }
-
-  act(fn, cx) {
-    cx.spawn(async (cx) => {
-      try {
-        await fn();
-        closeOverlay(props().overlay);
-      } catch (e) {
-        this.error = String(e?.message ?? e);
-        cx.notify();
-      }
-    });
   }
 
   render() {
@@ -35,21 +22,14 @@ export class Menu {
     const item = (id, label, onClick, color) => h_flex().id(id).h(30).px(14).items_center().cursor_pointer()
       .text_color(color ?? t.foreground).hover((s) => s.bg(t.hover))
       .on_click(onClick).child(label);
+    // Run now and pause/resume are buttons on the automation's line.
     const items = [];
-    if (!p.invalid) items.push(item("m-run", "Run now", (_e, cx) => this.act(() => cli.runNow(p.name), cx)));
     items.push(item("m-edit", "Edit", () => { closeOverlay(p.overlay); openOverlay(editSpec(p.name)); }));
-    if (!p.invalid) {
-      items.push(p.paused
-        ? item("m-resume", "Resume", (_e, cx) => this.act(() => cli.resume(p.name), cx))
-        : item("m-pause", "Pause", (_e, cx) => this.act(() => cli.pause(p.name), cx)));
-    }
     items.push(item("m-delete", "Delete…", () => {
       closeOverlay(p.overlay);
       openOverlay({ frame: "none", mod: "automate-everything", kind: "dialog", width: 420, height: 170, props: { view: "confirm", name: p.name } });
     }, t.blocked));
-    return frame(t).id("ae-menu").track_focus(this.handle).w_full().py(4)
-      .children(items)
-      .when(Boolean(this.error), (el) => el.child(div().px(14).py(6).text_size(11.5).text_color(t.blocked).child(this.error)));
+    return frame(t).id("ae-menu").track_focus(this.handle).w_full().py(4).children(items);
   }
 }
 

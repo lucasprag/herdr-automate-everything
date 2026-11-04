@@ -49,6 +49,13 @@ enum Cmd {
     Pause { name: String },
     /// Schedule it again
     Resume { name: String },
+    /// Move the entry to another place in the list
+    Move {
+        name: String,
+        /// Its new position, 1 being the top
+        #[arg(long)]
+        to: usize,
+    },
     /// Remove the entry from the config and delete its history
     Delete {
         name: String,
@@ -470,6 +477,11 @@ fn main() -> Result<()> {
         Cmd::Resume { name } => {
             config::set_paused(&name, false)?;
             println!("resumed {name}");
+            Ok(())
+        }
+        Cmd::Move { name, to } => {
+            config::move_to(&name, to)?;
+            println!("moved {name} to {to}");
             Ok(())
         }
         Cmd::Delete { name, yes } => {
