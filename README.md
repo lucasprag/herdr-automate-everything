@@ -296,3 +296,23 @@ picks it up within 5 minutes of them pulling.
 `cargo test` covers cron, daylight saving and config parsing. Point a test at
 a sandbox with `AUTOMATE_EVERYTHING_CONFIG` and `AUTOMATE_EVERYTHING_STATE`.
 Check the mod with `herdr-app check ~/.config/herdr-app/mods/automate-everything`.
+
+## Contributing
+
+Ideas, bug reports and pull requests are all welcome. If an automation did
+something you didn't expect, or you wished the panel did something it
+doesn't, open an issue and say what you expected. That alone helps.
+
+You don't need Rust to make a difference here. The panel is plain JavaScript
+(`panel.js`, `edit.js`, `popups.js`) and Herdr reloads it the moment you save.
+Changes to the scheduler or the command line live in `src/`; with `cargo`
+installed, your build is what runs, so you can try a change on your own
+automations before sending it.
+
+Before opening a pull request, run `cargo test` and `herdr-app check`, and try
+the change in the app. If it changes how something behaves, update
+[docs/requirements.md](docs/requirements.md) and this README to match.
+
+Coding agents are good at this kind of change. Herdr's `AGENTS.md` (in
+`~/.config/herdr-app`) teaches them how mods work, so open this folder in one
+and describe what you want.
