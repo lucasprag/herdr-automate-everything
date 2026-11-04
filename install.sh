@@ -2,7 +2,8 @@
 # Brings the installed copy up to date with this folder: rebuilds the binary
 # when src/ changed, then `service ensure` copies it to ~/.local/bin and makes
 # sure the launchd agent is written and running. Each step runs only when
-# something changed, so this is cheap to repeat.
+# something changed, so this is cheap to repeat. It also links the agent skill
+# (skills/automate-everything) into ~/.agents/skills and ~/.claude/skills.
 #
 # Nothing to do by hand: the Automations panel runs this when it loads and
 # every few minutes (log: .target/install.log, result: .target/install.status).
@@ -31,4 +32,13 @@ if [ ! -x "$bin" ] || [ -n "$(find src Cargo.toml Cargo.lock -newer "$bin" 2>/de
   cargo build --release || fail "the build failed"
 fi
 "$bin" service ensure || fail "installing failed"
+
+# The agent skill: link it where agents look for skills, unless something is
+# already there under that name.
+for dir in "$HOME/.agents/skills" "$HOME/.claude/skills"; do
+  link="$dir/automate-everything"
+  if [ -d "$dir" ] && [ ! -e "$link" ] && [ ! -L "$link" ]; then
+    ln -s "$PWD/skills/automate-everything" "$link" && echo "linked the skill into $dir"
+  fi
+done
 echo 0 > "$status"
