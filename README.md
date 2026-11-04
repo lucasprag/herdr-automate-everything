@@ -19,9 +19,9 @@ A few things you could set up:
    git clone https://github.com/lucasprag/herdr-automate-everything ~/.config/herdr-app/mods/automate-everything
    ```
 
-2. Open **Automations** in Herdr's side panel. The first time, it builds and
-   installs itself in the background, which takes a minute or two. You need
-   Rust's `cargo` for that ([rustup.rs](https://rustup.rs)).
+2. Open **Automations** in Herdr's side panel. The first time, it downloads
+   its program from the repo's releases and installs it in the background,
+   which takes a few seconds. Nothing else to install.
 3. Click **+**, give the automation a name, pick **Script** or **Agent**, set a
    schedule and save.
 4. Click the play button next to it to try it right away instead of waiting
@@ -132,7 +132,8 @@ command line, or work on the mod itself.
   line, so the two always agree.
 
 When the panel loads, and every 5 minutes after, it runs `install.sh`. That
-rebuilds the program if `src/` changed, copies it to
+downloads the released program for this version (or builds it, see Working
+on the mod), copies it to
 `~/.local/bin/automate-everything`, sets up and starts the background service,
 and links the agent skill. Each step only runs when something changed. Runs in
 progress keep going through an update. Install problems show in the panel; the
@@ -264,6 +265,25 @@ until they close themselves, and the space closes with its last tab.
 `.edit:<name>`, `.menu:<name>` and `.run:<run-id>` to the panel.
 
 ## Working on the mod
+
+`install.sh` downloads the released program only when this folder holds
+exactly the released source: the tag for `Cargo.toml`'s version exists and
+`src/`, `Cargo.toml` and `Cargo.lock` haven't changed since. Otherwise it
+builds with `cargo` ([rustup.rs](https://rustup.rs)), so your own changes are
+what runs. A download is checked against its `.sha256`; a private repo needs
+`gh` signed in.
+
+To release, bump `version` in `Cargo.toml`, run `cargo build` so `Cargo.lock`
+follows, commit, then tag and push:
+
+```sh
+git tag v0.2.0 && git push origin main v0.2.0
+```
+
+The release workflow (`.github/workflows/release.yml`) checks the tag matches
+the version, builds for Apple Silicon and Intel, joins them into one universal
+binary and attaches it and its checksum to a GitHub release. Everyone's panel
+picks it up within 5 minutes of them pulling.
 
 `cargo test` covers cron, daylight saving and config parsing. Point a test at
 a sandbox with `AUTOMATE_EVERYTHING_CONFIG` and `AUTOMATE_EVERYTHING_STATE`.
