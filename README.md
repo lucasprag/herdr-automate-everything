@@ -266,12 +266,20 @@ until they close themselves, and the space closes with its last tab.
 
 ## Working on the mod
 
-`install.sh` downloads the released program only when this folder holds
-exactly the released source: the tag for `Cargo.toml`'s version exists and
-`src/`, `Cargo.toml` and `Cargo.lock` haven't changed since. Otherwise it
-builds with `cargo` ([rustup.rs](https://rustup.rs)), so your own changes are
-what runs. A download is checked against its `.sha256`; a private repo needs
-`gh` signed in.
+You don't need a release to change the Rust part. `install.sh` picks the
+program like this:
+
+1. When this folder holds exactly the released source (the tag for
+   `Cargo.toml`'s version exists and `src/`, `Cargo.toml` and `Cargo.lock`
+   haven't changed since), it downloads that release.
+2. Otherwise, if `cargo` is installed ([rustup.rs](https://rustup.rs)), it
+   builds `src/`, so your changes are what runs, committed or not.
+3. Without `cargo`, it downloads the latest release. Someone who pulls
+   unreleased Rust changes keeps a working mod; the changes reach them with
+   the next release.
+
+Downloads are checked against their `.sha256`. A private repo needs `gh`
+signed in.
 
 To release, bump `version` in `Cargo.toml`, run `cargo build` so `Cargo.lock`
 follows, commit, then tag and push:
