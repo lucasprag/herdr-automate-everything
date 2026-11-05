@@ -316,3 +316,7 @@ the change in the app. If it changes how something behaves, update
 Coding agents are good at this kind of change. Herdr's `AGENTS.md` (in
 `~/.config/herdr-app`) teaches them how mods work, so open this folder in one
 and describe what you want.
+
+## License
+
+[MIT](LICENSE)
