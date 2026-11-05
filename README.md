@@ -3,6 +3,8 @@
 **Run scripts and AI agents on a schedule from Herdr.** They keep running on time
 even when the app is closed.
 
+![The Automations panel in Herdr](app/preview.png)
+
 A few things you could set up:
 
 - Every weekday at 9:00, run a script that pulls the latest code in all your repos.
