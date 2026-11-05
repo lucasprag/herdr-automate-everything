@@ -1,6 +1,6 @@
 # Automate everything
 
-Run scripts and AI agents on a schedule from Herdr. They keep running on time
+**Run scripts and AI agents on a schedule from Herdr.** They keep running on time
 even when the app is closed.
 
 A few things you could set up:
