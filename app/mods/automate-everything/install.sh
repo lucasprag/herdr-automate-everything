@@ -1,7 +1,7 @@
 #!/bin/sh
 # Brings the installed copy up to date with this folder: downloads the
-# released binary for this version (or builds it when src/ has changed since
-# the release), then `service ensure` copies it to ~/.local/bin and makes
+# released binary for the version in VERSION (or, when scripts/install-mod.sh
+# recorded a source checkout whose src/ changed since that release, builds it), then `service ensure` copies it to ~/.local/bin and makes
 # sure the launchd agent is written and running. Each step runs only when
 # something changed, so this is cheap to repeat. It also links the agent skill
 # (skills/automate-everything) into ~/.agents/skills and ~/.claude/skills.
@@ -29,23 +29,35 @@ fail() { echo "$1"; echo 1 > "$status"; exit 1; }
 # The panel runs this with a short PATH; add where gh and cargo usually live.
 PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin"
 
-version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+# The version this mod runs, pinned in VERSION (release.yml checks a tag
+# matches it and Cargo.toml).
+version=$(tr -d '[:space:]' < VERSION 2>/dev/null)
 tag="v$version"
-repo=$(git remote get-url origin 2>/dev/null | sed -n 's#.*github\.com[:/]\(.*\)$#\1#p' | sed 's#\.git$##')
-repo=${repo:-lucasprag/herdr-automate-everything}
+repo=lucasprag/herdr-automate-everything
+
+# A source checkout, recorded by the repo's scripts/install-mod.sh. Without
+# one this folder is a plain copy and runs the release for its version.
+src_dir=$(cat .target/source 2>/dev/null)
+if [ -n "$src_dir" ] && [ -f "$src_dir/Cargo.toml" ]; then
+  r=$(git -C "$src_dir" remote get-url origin 2>/dev/null | sed -n 's#.*github\.com[:/]\(.*\)$#\1#p' | sed 's#\.git$##')
+  repo=${r:-$repo}
+else
+  src_dir=""
+fi
 
 # Which binary runs:
-# 1. This version's release, when this folder holds exactly the released
-#    source (the version's tag exists and src/ hasn't changed since; a copy
-#    that isn't a git checkout trusts its version). No Rust needed.
-# 2. Otherwise a build of src/ with cargo, so changes run without a release.
-# 3. Without cargo, the latest release: src/ has unreleased changes, but the
-#    mod still works for someone who never installed Rust.
-released=no
-if git rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1; then
-  git diff --quiet "$tag" -- src Cargo.toml Cargo.lock 2>/dev/null && released=yes
-elif ! git rev-parse --git-dir >/dev/null 2>&1; then
-  released=yes
+# 1. This version's release, unless the checkout's src/ has changed since that
+#    release's tag. No Rust needed.
+# 2. Otherwise a build of the checkout with cargo, so changes run without a
+#    release.
+# 3. Without cargo, the latest release: the checkout has unreleased changes,
+#    but the mod still works for someone who never installed Rust.
+released=yes
+if [ -n "$src_dir" ]; then
+  released=no
+  if git -C "$src_dir" rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1; then
+    git -C "$src_dir" diff --quiet "$tag" -- src Cargo.toml Cargo.lock 2>/dev/null && released=yes
+  fi
 fi
 
 # download <tag> <dest>: the release's universal binary, checked against its
@@ -88,17 +100,17 @@ bin=""
 if [ "$released" = yes ]; then
   bin=$(get "$tag") || { bin=""; echo "couldn't download $tag from $repo"; }
 fi
-if [ -z "$bin" ] && command -v cargo >/dev/null 2>&1; then
-  bin=.target/release/automate-everything
-  if [ ! -x "$bin" ] || [ -n "$(find src Cargo.toml Cargo.lock -newer "$bin" 2>/dev/null | head -1)" ]; then
-    echo "building…"
-    cargo build --release || fail "the build failed"
+if [ -z "$bin" ] && [ -n "$src_dir" ] && command -v cargo >/dev/null 2>&1; then
+  bin="$src_dir/.target/release/automate-everything"
+  if [ ! -x "$bin" ] || [ -n "$(find "$src_dir/src" "$src_dir/Cargo.toml" "$src_dir/Cargo.lock" -newer "$bin" 2>/dev/null | head -1)" ]; then
+    echo "building $src_dir…"
+    (cd "$src_dir" && cargo build --release) || fail "the build failed"
   fi
 fi
 if [ -z "$bin" ]; then
   latest=$(latest_tag)
   if [ -n "$latest" ] && bin=$(get "$latest"); then
-    [ "$released" = no ] && echo "running $latest: src/ has changes since, which need Rust (rustup.rs) to build"
+    [ "$released" = no ] && echo "running $latest: $src_dir has changes since, which need Rust (rustup.rs) to build"
   else
     # Offline: the newest release downloaded before, if any.
     bin=$(ls -t .target/dist/automate-everything-* 2>/dev/null | head -1)

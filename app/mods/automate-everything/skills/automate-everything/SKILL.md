@@ -9,7 +9,7 @@ One binary, `automate-everything`, owns the config, the scheduler (a launchd age
 
 Act through the CLI. `set`, `pause`, `resume` and `delete` validate the whole entry before writing and rewrite only that entry, keeping the file's comments and order. Hand edits to the TOML also work, since the scheduler rereads it every minute, but run `check` after them.
 
-Field reference and defaults: the Config section of `~/.config/herdr-app/mods/automate-everything/README.md`. Read it before creating an entry.
+Field reference and defaults: the Config file section of the repo's README, https://github.com/lucasprag/herdr-automate-everything#config-file. Read it before creating an entry.
 
 ## Checking on automations
 

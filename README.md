@@ -13,11 +13,15 @@ A few things you could set up:
 
 ## Getting started
 
-1. Clone this repo into your Herdr mods folder:
+1. Clone this repo anywhere and copy the mod into Herdr:
 
    ```sh
-   git clone https://github.com/lucasprag/herdr-automate-everything ~/.config/herdr-app/mods/automate-everything
+   git clone https://github.com/lucasprag/herdr-automate-everything ~/Projects/herdr-automate-everything
+   ~/Projects/herdr-automate-everything/scripts/install-mod.sh
    ```
+
+   Or ask your coding agent to add the mod from
+   [`app/mods/automate-everything`](app/mods/automate-everything) in this repo.
 
 2. Open **Automations** in Herdr's side panel. The first time, it downloads
    its program from the repo's releases and installs it in the background,
@@ -27,8 +31,18 @@ A few things you could set up:
 4. Click the play button next to it to try it right away instead of waiting
    for the schedule.
 
-From then on it runs by itself. Updates install themselves too: pull the repo
-and the panel takes care of the rest.
+From then on it runs by itself. To update, `git pull` and run
+`scripts/install-mod.sh` again; the panel installs the new program within
+5 minutes.
+
+## What's in this repo
+
+| Path | What it is |
+|---|---|
+| `src/`, `Cargo.toml` | The `automate-everything` program (Rust): scheduler, runner, command line |
+| `app/mods/automate-everything/` | The Herdr mod: the Automations panel, `install.sh` and the agent skill |
+| `scripts/install-mod.sh` | Copies the mod into `~/.config/herdr-app/mods/` |
+| `docs/requirements.md` | What it has to do |
 
 ## Scripts and agents
 
@@ -127,7 +141,7 @@ command line, or work on the mod itself.
   keeps the schedule, starts the runs, stores the config and the history, and
   has a command line for all of it. It runs as a background service (a launchd
   agent), which is why automations fire with the app closed.
-- **The Automations panel** (`main.js` and the other `.js` files) is a view on
+- **The Automations panel** (`app/mods/automate-everything/`) is a view on
   top of that program. Anything you do in the panel goes through the command
   line, so the two always agree.
 
@@ -137,7 +151,7 @@ on the mod), copies it to
 `~/.local/bin/automate-everything`, sets up and starts the background service,
 and links the agent skill. Each step only runs when something changed. Runs in
 progress keep going through an update. Install problems show in the panel; the
-log is `.target/install.log`.
+log is `~/.config/herdr-app/mods/automate-everything/.target/install.log`.
 
 To uninstall the background service: `automate-everything service uninstall`.
 
@@ -266,22 +280,27 @@ until they close themselves, and the space closes with its last tab.
 
 ## Working on the mod
 
-You don't need a release to change the Rust part. `install.sh` picks the
-program like this:
+Herdr runs the copy in `~/.config/herdr-app/mods/automate-everything`, not
+this checkout. Edit here, then run `scripts/install-mod.sh` to copy the mod
+over; Herdr reloads it right away. The script also records this checkout in
+the copy, so you don't need a release to change the Rust part. The mod's
+`install.sh` picks the program like this:
 
-1. When this folder holds exactly the released source (the tag for
-   `Cargo.toml`'s version exists and `src/`, `Cargo.toml` and `Cargo.lock`
-   haven't changed since), it downloads that release.
-2. Otherwise, if `cargo` is installed ([rustup.rs](https://rustup.rs)), it
-   builds `src/`, so your changes are what runs, committed or not.
-3. Without `cargo`, it downloads the latest release. Someone who pulls
+1. A copy with no checkout recorded (added by hand or by an agent) downloads
+   the release for the version in `app/mods/automate-everything/VERSION`.
+2. With a checkout whose `src/`, `Cargo.toml` and `Cargo.lock` match that
+   version's tag, it downloads that release too.
+3. Otherwise, if `cargo` is installed ([rustup.rs](https://rustup.rs)), it
+   builds the checkout, so your changes are what runs, committed or not.
+4. Without `cargo`, it downloads the latest release. Someone who pulls
    unreleased Rust changes keeps a working mod; the changes reach them with
    the next release.
 
 Downloads are checked against their `.sha256`. A private repo needs `gh`
 signed in.
 
-To release, bump `version` in `Cargo.toml`, run `cargo build` so `Cargo.lock`
+To release, bump `version` in `Cargo.toml` and in
+`app/mods/automate-everything/VERSION`, run `cargo build` so `Cargo.lock`
 follows, commit, then tag and push:
 
 ```sh
@@ -289,13 +308,14 @@ git tag v0.2.0 && git push origin main v0.2.0
 ```
 
 The release workflow (`.github/workflows/release.yml`) checks the tag matches
-the version, builds for Apple Silicon and Intel, joins them into one universal
+both versions, builds for Apple Silicon and Intel, joins them into one universal
 binary and attaches it and its checksum to a GitHub release. Everyone's panel
-picks it up within 5 minutes of them pulling.
+picks it up within 5 minutes of them pulling and running
+`scripts/install-mod.sh`.
 
 `cargo test` covers cron, daylight saving and config parsing. Point a test at
 a sandbox with `AUTOMATE_EVERYTHING_CONFIG` and `AUTOMATE_EVERYTHING_STATE`.
-Check the mod with `herdr-app check ~/.config/herdr-app/mods/automate-everything`.
+`scripts/install-mod.sh` ends with `herdr-app check` on the copy.
 
 ## Contributing
 
@@ -304,7 +324,8 @@ something you didn't expect, or you wished the panel did something it
 doesn't, open an issue and say what you expected. That alone helps.
 
 You don't need Rust to make a difference here. The panel is plain JavaScript
-(`panel.js`, `edit.js`, `popups.js`) and Herdr reloads it the moment you save.
+(`app/mods/automate-everything/`: `panel.js`, `edit.js`, `popups.js`) and Herdr
+reloads it as soon as `scripts/install-mod.sh` copies it over.
 Changes to the scheduler or the command line live in `src/`; with `cargo`
 installed, your build is what runs, so you can try a change on your own
 automations before sending it.

@@ -1,26 +1,19 @@
 // The panel's only way in: the automate-everything CLI. It owns the config
 // file, history and runs; the panel never writes them itself.
 
-import { exec, home, appHome } from "herdr";
+import { exec, home } from "herdr";
 import { exists } from "fs/promises";
 
 let bin = null;
 
-// ~/.local/bin (installed), else this folder's own build.
+// Installed by install.sh (service ensure) in ~/.local/bin.
 async function binary() {
   if (bin) return bin;
-  const candidates = [
-    `${home()}/.local/bin/automate-everything`,
-    `${appHome()}/mods/automate-everything/.target/release/automate-everything`,
-    `${appHome()}/mods/automate-everything/.target/debug/automate-everything`,
-  ];
-  for (const c of candidates) {
-    try {
-      // Remember only the installed one; until it exists, look again each time.
-      if (await exists(c)) return c === candidates[0] ? (bin = c) : c;
-    } catch {}
-  }
-  throw new Error("automate-everything isn't installed: run install.sh in mods/automate-everything");
+  const c = `${home()}/.local/bin/automate-everything`;
+  try {
+    if (await exists(c)) return (bin = c);
+  } catch {}
+  throw new Error("automate-everything isn't installed yet: the panel runs install.sh, see mods/automate-everything/.target/install.log");
 }
 
 async function call(args) {

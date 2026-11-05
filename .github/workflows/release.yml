@@ -16,11 +16,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Check the tag matches Cargo.toml
+      - name: Check the tag matches Cargo.toml and the mod's VERSION
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "tag $GITHUB_REF_NAME doesn't match Cargo.toml's version $version"
+          pinned=$(tr -d '[:space:]' < app/mods/automate-everything/VERSION)
+          if [ "v$version" != "$GITHUB_REF_NAME" ] || [ "v$pinned" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME doesn't match Cargo.toml ($version) and app/mods/automate-everything/VERSION ($pinned)"
             exit 1
           fi
 
