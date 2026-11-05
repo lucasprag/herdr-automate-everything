@@ -194,7 +194,7 @@ env = { GREETING = "hi" }
 [automations.nightly-review]
 kind = "agent"
 schedule = "0 7 * * 1-5"
-repo = "~/Projects/smile/smile-core"
+repo = "~/Projects/my-app"
 directory = "worktree"         # repo (default) | worktree: a new git worktree per run
 base_branch = "origin/main"    # worktree only; fetched first
 space = "per-run"              # per-run (default) | shared: tabs in one space named space_name
@@ -324,6 +324,18 @@ a sandbox with `AUTOMATE_EVERYTHING_CONFIG` and `AUTOMATE_EVERYTHING_STATE`.
 Ideas, bug reports and pull requests are all welcome. If an automation did
 something you didn't expect, or you wished the panel did something it
 doesn't, open an issue and say what you expected. That alone helps.
+
+Some bigger things that would be great to have:
+
+- **Linux support.** The scheduler runs as a launchd agent (`src/service.rs`)
+  and releases are macOS-only (`.github/workflows/release.yml`). Linux would
+  need a systemd user unit instead, and Linux builds in the release.
+- **Windows support.** Same idea with a Windows service or Task Scheduler,
+  plus Windows builds. Agent runs go through herdr-core, which also runs on
+  Windows.
+- **Automations on another machine.** herdr-core can run terminals on other
+  machines (`hc run --on <machine>`), so an automation could pick where it
+  runs.
 
 You don't need Rust to make a difference here. The panel is plain JavaScript
 (`app/mods/automate-everything/`: `panel.js`, `edit.js`, `popups.js`) and Herdr

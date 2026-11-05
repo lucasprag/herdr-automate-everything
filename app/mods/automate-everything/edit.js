@@ -15,7 +15,7 @@ const FIELDS = [
   ["grace_minutes", "Grace (minutes)", "How late a missed fire may still run (default 10)", "all", "int"],
   ["command", "Command", "Shell command, e.g. ~/.local/bin/my-script --flag", "script", "text"],
   ["cwd", "Folder", "Where it runs (empty: home)", "script", "text"],
-  ["repo", "Repo", "e.g. ~/Projects/smile/smile-core", "agent", "text"],
+  ["repo", "Repo", "e.g. ~/Projects/my-app", "agent", "text"],
   ["base_branch", "Base branch", "For worktrees (default origin/main)", "worktree", "text"],
   ["space_name", "Space name", "Empty: the automation's name", "agent", "text"],
   ["agent", "Agent", "Program to run (default claude)", "agent", "text"],
