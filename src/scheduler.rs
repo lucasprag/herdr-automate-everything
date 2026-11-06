@@ -6,6 +6,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
+use std::process::Command;
 use std::time::Duration as StdDuration;
 
 use anyhow::Result;
@@ -184,8 +186,21 @@ pub fn serve() -> Result<()> {
             last_prune = Some(Utc::now());
         }
 
+        // Runs started before an exec (below) are still this pid's children
+        // but no thread waits on them any more; reap them here.
+        while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
+
+        // A new binary takes over in place, keeping the pid. Exiting and
+        // leaving the restart to launchd's KeepAlive isn't reliable: launchd
+        // can pend that respawn ("inefficient") indefinitely. The lock's fd is
+        // close-on-exec, so the new image takes the lock again.
         if exe_identity() != exe {
-            log("binary changed; exiting so launchd starts the new one");
+            log("binary changed; restarting as the new one");
+            let err = match std::env::current_exe() {
+                Ok(path) => Command::new(path).args(std::env::args_os().skip(1)).exec(),
+                Err(e) => e,
+            };
+            log(&format!("couldn't restart as the new binary ({err}); exiting so launchd starts it"));
             return Ok(());
         }
 

@@ -1,6 +1,7 @@
 //! The launchd agent that keeps the scheduler alive, also while the Herdr
-//! app is closed. launchd restarts it when it exits, which is how a new
-//! binary takes over.
+//! app is closed. A new binary takes over by the scheduler re-executing
+//! itself; launchd pends its own spawns and respawns, so `ensure` checks the
+//! scheduler is really up and kicks it when it isn't.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -118,7 +119,7 @@ fn ensure() -> Result<()> {
     let mut did = Vec::new();
 
     // 1. This binary in ~/.local/bin. Swapped in atomically; a running
-    //    scheduler sees the new file and exits, and launchd starts it again.
+    //    scheduler sees the new file within a minute and re-executes as it.
     let exe = installed_exe();
     let me = std::env::current_exe()?;
     let me_is_installed = std::fs::canonicalize(&me).ok() == std::fs::canonicalize(&exe).ok();
