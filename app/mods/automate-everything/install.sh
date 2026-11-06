@@ -27,7 +27,7 @@ trap 'rmdir "$lock" 2>/dev/null' EXIT
 fail() { echo "$1"; echo 1 > "$status"; exit 1; }
 
 # The panel runs this with a short PATH; add where gh and cargo usually live.
-PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin"
+PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:${ASDF_DATA_DIR:-$HOME/.asdf}/shims"
 
 # The version this mod runs, pinned in VERSION (release.yml checks a tag
 # matches it and Cargo.toml).

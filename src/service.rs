@@ -8,7 +8,7 @@ use std::process::Command;
 use anyhow::{bail, Result};
 use clap::Subcommand;
 
-use crate::paths;
+use crate::{lock, paths};
 
 pub const LABEL: &str = "com.lucasprag.automate-everything";
 
@@ -78,6 +78,40 @@ fn same_file_contents(a: &std::path::Path, b: &std::path::Path) -> bool {
     }
 }
 
+fn scheduler_running() -> bool {
+    lock::is_held(&paths::scheduler_lock())
+}
+
+// Starts the scheduler unless it's running; true when it had to. A loaded job
+// isn't necessarily running: right after a bootstrap launchd can leave a
+// RunAtLoad job as a pending "speculative" spawn that never happens, so this
+// kicks it and waits for its lock, which a started scheduler takes right away.
+fn start(target: &str) -> Result<bool> {
+    if scheduler_running() {
+        return Ok(false);
+    }
+    let out = launchctl(&["kickstart", target])?;
+    if !out.status.success() {
+        bail!("launchctl kickstart failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    for _ in 0..20 {
+        if scheduler_running() {
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    bail!("the scheduler didn't start (log {}): {}", paths::scheduler_log().display(), log_tail());
+}
+
+fn log_tail() -> String {
+    let log = std::fs::read_to_string(paths::scheduler_log()).unwrap_or_default();
+    let lines: Vec<&str> = log.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return "launchd never ran it (launchctl print gui/$UID/".to_string() + LABEL + ")";
+    }
+    lines[lines.len().saturating_sub(3)..].join(" ")
+}
+
 fn ensure() -> Result<()> {
     paths::ensure_state_dirs()?;
     let target = format!("{}/{LABEL}", domain());
@@ -114,6 +148,9 @@ fn ensure() -> Result<()> {
         if !out.status.success() {
             bail!("launchctl bootstrap failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
+        did.push("loaded the launchd agent");
+    }
+    if start(&target)? {
         did.push("started the scheduler");
     }
     println!("{}", if did.is_empty() { "already installed".to_string() } else { did.join(", ") });
@@ -138,6 +175,7 @@ pub fn run(action: Action) -> Result<()> {
             if !out.status.success() {
                 bail!("launchctl bootstrap failed: {}", String::from_utf8_lossy(&out.stderr).trim());
             }
+            start(&target)?;
             println!("installed {} ({})", LABEL, path.display());
         }
         Action::Uninstall => {
