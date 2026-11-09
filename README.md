@@ -265,10 +265,13 @@ An agent run can open more tabs in its own space, for a helper agent or a shell
 in another worktree, and close them when they're done:
 
 ```
-automate-everything tab open --name <tab> --cwd <dir> [--label k=v] [--trust] [--wait-start] [-- <program> <args>]
+automate-everything tab open --name <tab> --cwd <dir> [--space <id> | --new-space <name>] [--label k=v] [--trust] [--wait-start] [-- <program> <args>]
 automate-everything tab close --label k=v [--except-self] | tab close --self
 ```
 
+The tab opens in the caller's space, or `--space <id>`; `--new-space <name>`
+opens it as the first tab of a new space with that name (its id is `space` in
+the printed JSON), so a run can give a piece of work its own space.
 `--trust` answers Claude's folder-trust question for `--cwd` only.
 `--wait-start` waits until the agent has taken its prompt. `tab close` only
 closes tabs opened with `tab open`, never the run's own tab or anything you

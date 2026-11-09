@@ -31,8 +31,11 @@ pub enum Action {
         #[arg(long = "label")]
         labels: Vec<String>,
         /// The space's id (default: the space of the terminal running this)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "new_space")]
         space: Option<String>,
+        /// Open it in a new space with this name, instead of an existing one
+        #[arg(long, value_name = "NAME")]
+        new_space: Option<String>,
         /// Answer Claude's folder-trust question, for --cwd and no other folder
         #[arg(long)]
         trust: bool,
@@ -60,8 +63,8 @@ pub enum Action {
 
 pub fn run(action: Action) -> Result<()> {
     match action {
-        Action::Open { name, cwd, labels, space, trust, wait_start, argv } => {
-            let out = open(&name, &cwd, &labels, space, trust, wait_start, argv)?;
+        Action::Open { name, cwd, labels, space, new_space, trust, wait_start, argv } => {
+            let out = open(&name, &cwd, &labels, space, new_space, trust, wait_start, argv)?;
             println!("{out}");
             Ok(())
         }
@@ -97,6 +100,7 @@ fn open(
     cwd: &str,
     raw_labels: &[String],
     space: Option<String>,
+    new_space: Option<String>,
     trust: bool,
     wait_start: bool,
     argv: Vec<String>,
@@ -106,9 +110,9 @@ fn open(
         bail!("--cwd {cwd} is not a folder");
     }
     let me = caller()?;
-    let space = match space.or_else(|| me.as_ref().and_then(|t| label(t, "herdr.space"))) {
+    let space = match new_space.as_ref().map(|_| hc::new_id("sp")).or(space).or_else(|| me.as_ref().and_then(|t| label(t, "herdr.space"))) {
         Some(s) => s,
-        None => bail!("no space: run this from a terminal in a Herdr space, or pass --space"),
+        None => bail!("no space: run this from a terminal in a Herdr space, or pass --space or --new-space"),
     };
     // Who opened it: the run (its id), or whoever opened the caller.
     let opened_by = me
@@ -140,7 +144,12 @@ fn open(
         v
     };
     let terminal = hc::launch(&hc::Launch { cwd: &cwd, labels, argv: full })?;
-    let named = hc::name_tab(&space, &tab, name, &terminal).err().map(|e| format!("{e:#}"));
+    let named = match &new_space {
+        Some(space_name) => hc::name_space_and_tab(&space, space_name, &cwd, &tab, name, &terminal),
+        None => hc::name_tab(&space, &tab, name, &terminal),
+    }
+    .err()
+    .map(|e| format!("{e:#}"));
 
     let mut out = json!({ "terminal": terminal, "space": space, "tab": tab, "cwd": cwd });
     if let Some(e) = named {
