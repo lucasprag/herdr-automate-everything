@@ -103,7 +103,7 @@ fi
 if [ -z "$bin" ] && [ -n "$src_dir" ] && command -v cargo >/dev/null 2>&1; then
   bin="$src_dir/.target/release/automate-everything"
   if [ ! -x "$bin" ] || [ -n "$(find "$src_dir/src" "$src_dir/Cargo.toml" "$src_dir/Cargo.lock" -newer "$bin" 2>/dev/null | head -1)" ]; then
-    echo "building $src_dir…"
+    echo "building ${src_dir}…"
     (cd "$src_dir" && cargo build --release) || fail "the build failed"
   fi
 fi
