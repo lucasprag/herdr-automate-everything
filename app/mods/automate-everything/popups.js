@@ -4,9 +4,8 @@
 
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { theme, props, closeOverlay, openOverlay } from "herdr";
+import { theme, props, closeOverlay, openOverlay, run } from "herdr";
 import * as cli from "./cli.js";
-import { editSpec } from "./panel.js";
 
 const frame = (t) => v_flex().bg(t.popover).border_1().border_color(t.border).shadow_lg().text_size(13);
 
@@ -24,7 +23,8 @@ export class Menu {
       .on_click(onClick).child(label);
     // Run now and pause/resume are buttons on the automation's line.
     const items = [];
-    items.push(item("m-edit", "Edit", () => { closeOverlay(p.overlay); openOverlay(editSpec(p.name)); }));
+    // The panel opens the form: a dialog opened from this popup loses its async load when the popup closes.
+    items.push(item("m-edit", "Edit", () => { closeOverlay(p.overlay); run(`automate-everything.edit:${p.name}`); }));
     items.push(item("m-delete", "Delete…", () => {
       closeOverlay(p.overlay);
       openOverlay({ frame: "none", mod: "automate-everything", kind: "dialog", width: 420, height: 170, props: { view: "confirm", name: p.name } });
