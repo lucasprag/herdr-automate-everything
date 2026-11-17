@@ -2,7 +2,8 @@
 # Brings the installed copy up to date with this folder: downloads the
 # released binary for the version in VERSION (or, when scripts/install-mod.sh
 # recorded a source checkout whose src/ changed since that release, builds it), then `service ensure` copies it to ~/.local/bin and makes
-# sure the launchd agent is written and running. Each step runs only when
+# sure the background service (a launchd agent on macOS, a systemd user
+# service on Linux) is written and running. Each step runs only when
 # something changed, so this is cheap to repeat. It also links the agent skill
 # (skills/automate-everything) into ~/.agents/skills and ~/.claude/skills.
 #
@@ -60,11 +61,26 @@ if [ -n "$src_dir" ]; then
   fi
 fi
 
-# download <tag> <dest>: the release's universal binary, checked against its
-# checksum. curl works for a public repo; gh (signed in) for a private one.
+# The release asset for this machine: one universal macOS binary, or a static
+# Linux one per architecture.
+case "$(uname -s)/$(uname -m)" in
+  Darwin/*) asset=automate-everything-macos ;;
+  Linux/x86_64 | Linux/amd64) asset=automate-everything-linux-x86_64 ;;
+  Linux/aarch64 | Linux/arm64) asset=automate-everything-linux-aarch64 ;;
+  *) asset="" ;;
+esac
+
+# sha256 <file>: its checksum. shasum on macOS, sha256sum on Linux.
+sha256() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1"; else sha256sum "$1"; fi | awk '{print $1}'
+}
+
+# download <tag> <dest>: the release's binary for this machine, checked
+# against its checksum. curl works for a public repo; gh (signed in) for a
+# private one.
 download() {
   dir=.target/dist
-  asset=automate-everything-macos
+  [ -n "$asset" ] || { echo "no released binary for $(uname -s) $(uname -m)"; return 1; }
   rm -rf "$dir/.new" && mkdir -p "$dir/.new" || return 1
   url="https://github.com/$repo/releases/download/$1/$asset"
   if ! { curl -fsSL -o "$dir/.new/$asset" "$url" && curl -fsSL -o "$dir/.new/$asset.sha256" "$url.sha256"; } 2>/dev/null; then
@@ -73,14 +89,16 @@ download() {
       || return 1
   fi
   want=$(awk '{print $1}' "$dir/.new/$asset.sha256")
-  got=$(shasum -a 256 "$dir/.new/$asset" | awk '{print $1}')
+  got=$(sha256 "$dir/.new/$asset")
   [ -n "$want" ] && [ "$want" = "$got" ] || { echo "the download of $1 didn't match its checksum"; return 1; }
   chmod +x "$dir/.new/$asset" && mv "$dir/.new/$asset" "$2" && rm -rf "$dir/.new"
 }
 
 # get <tag>: that release's binary, downloaded once; prints its path.
 get() {
-  dest=.target/dist/automate-everything-${1#v}
+  # Named by asset too, so a mod folder synced between machines never runs
+  # another platform's binary.
+  dest=.target/dist/$asset-${1#v}
   if [ ! -x "$dest" ]; then
     echo "downloading ${1}…" >&2
     download "$1" "$dest" >&2 || return 1
@@ -113,7 +131,11 @@ if [ -z "$bin" ]; then
     [ "$released" = no ] && echo "running $latest: $src_dir has changes since, which need Rust (rustup.rs) to build"
   else
     # Offline: the newest release downloaded before, if any.
-    bin=$(ls -t .target/dist/automate-everything-* 2>/dev/null | head -1)
+    # Downloads from before they were named by asset were all macOS ones.
+    old=""
+    [ "$asset" = automate-everything-macos ] && old=".target/dist/automate-everything-[0-9]*"
+    # shellcheck disable=SC2086
+    bin=$(ls -t .target/dist/"$asset"-* $old 2>/dev/null | head -1)
     [ -n "$bin" ] || fail "couldn't download a release from $repo, and cargo isn't installed to build one"
     echo "offline: running $bin"
   fi

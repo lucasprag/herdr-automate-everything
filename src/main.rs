@@ -98,7 +98,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// The launchd agent that keeps the scheduler running
+    /// The background service that keeps the scheduler running (launchd on
+    /// macOS, systemd on Linux)
     Service {
         #[command(subcommand)]
         action: service::Action,
@@ -108,7 +109,7 @@ enum Cmd {
         #[command(subcommand)]
         action: tabs::Action,
     },
-    /// Run the scheduler in the foreground (launchd does this)
+    /// Run the scheduler in the foreground (the background service does this)
     Scheduler,
     #[command(name = "_run", hide = true)]
     RunInternal {
@@ -444,7 +445,7 @@ fn status(json_out: bool) -> Result<()> {
     let v = json!({
         "scheduler_running": running,
         "scheduler": if running { note } else { None },
-        "service_installed": service::plist_path().exists(),
+        "service_installed": service::installed(),
         "config": paths::config_file(),
         "state": paths::state_dir(),
         "log": paths::scheduler_log(),
@@ -460,6 +461,10 @@ fn status(json_out: bool) -> Result<()> {
         println!("config     {}", paths::config_file().display());
         println!("state      {}", paths::state_dir().display());
         println!("log        {}", paths::scheduler_log().display());
+        // Not in --json: the panel polls that, and on Linux this asks loginctl.
+        for w in service::warnings() {
+            println!("warning    {w}");
+        }
     }
     Ok(())
 }

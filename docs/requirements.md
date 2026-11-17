@@ -29,7 +29,7 @@ Terminology:
 9. **Cron schedules**, including weekday-only and hour ranges such as `30 8-15 * * 1-5`.
 10. **A timezone per automation**, defaulting to the system zone. DST-correct: a fixed-time cron fires once on the night the clocks go back, and is not lost on the night they go forward.
 11. **Catch-up with a grace window.** The laptop sleeps. A 7:30 fire missed until 8:10 should still run; a two-minute job missed by an hour should not. Per-automation `grace_minutes`. A fire older than its grace window is recorded as `missed`, and a run of missed fires catches up once, not once per fire.
-12. **Fires without the app window open.** The scheduler must survive the app being closed (a launchd job on macOS).
+12. **Fires without the app window open.** The scheduler must survive the app being closed (a launchd job on macOS, a systemd user service on Linux; on Linux that needs lingering, `loginctl enable-linger`, to keep running after logout, and `status` warns when it's off).
 13. **Timeouts**, separately for the precheck and for the run.
 14. **No overlapping runs of one automation**, whoever started them. A fire that comes due while the same automation is still running, including a manual run, is recorded as `skipped_overlap`, not queued. A blocked run counts as still running until the user finishes it or closes its space. Different automations may run at once.
 15. **One scheduler.** A lock held by the kernel (not a pidfile) keeps a second scheduler from double-firing. The scheduler survives `herdr plugin update` and restarts on the new binary. One invalid entry (a bad cron, a missing script) is reported and skipped; the others keep running.
@@ -43,7 +43,7 @@ Terminology:
       - **a specific space**, named in the entry. The run opens a tab in it, named after the automation. If that space is not open, the run creates it with that name; the plugin then owns it, so a successful run closes it (behaviour 2). Naming the space after the automation gives one shared space that collects that automation's runs as tabs.
 
     Scripts have no space (behaviour 1), so these choices apply to agent runs only.
-17. **Environment.** Scripts, prechecks and agents start with the user's login `PATH`, not launchd's bare one. Per-automation `env`. Every run gets `HERDR_AUTOMATION` (the name) and `HERDR_AUTOMATION_RUN_ID`, so a script can tell it was scheduled.
+17. **Environment.** Scripts, prechecks and agents start with the user's login `PATH`, not the service manager's bare one. When `$SHELL` is unset (launchd and systemd may not set it) the login shell comes from the passwd database, else `/bin/sh`. Per-automation `env`. Every run gets `HERDR_AUTOMATION` (the name) and `HERDR_AUTOMATION_RUN_ID`, so a script can tell it was scheduled.
 18. **Manual run** from the panel or the CLI, including on a paused entry. A manual run skips the precheck (as in Orca) and follows the same close and cleanup rules as a scheduled one.
 19. **Pause and resume** without deleting the entry, from the panel and the CLI.
 
@@ -63,6 +63,7 @@ The panel follows Orca's automations interface: a home page and a history page.
 26. Works with the **desktop app's hc backend**. The TUI backend is not a goal.
 27. **One config file** for scripts and agents. Splitting them (gates.json for scripts, automations.yaml for agents) hides the scripts from the panel. The panel and the CLI both write to it, so its format must survive a program rewriting one entry.
 28. **No stale spaces or worktrees as a side effect.** The original problem.
+29. **macOS and Linux.** The scheduler, scripts and the CLI run on both: a launchd agent on macOS, a systemd user service (`~/.config/systemd/user/com.lucasprag.automate-everything.service`) on Linux, with the same commands (`service install|ensure|uninstall|restart`, `status`). Releases ship a universal macOS binary and static (musl) Linux binaries for x86_64 and aarch64. Agent runs on Linux need `hc` and the agent on the login shell's PATH and are not yet verified there.
 
 ## Out of scope
 

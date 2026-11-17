@@ -104,7 +104,7 @@ pub fn run(a: &Automation, run: &mut Run) -> Result<()> {
 
     // 4. Launch, inside a login shell that stays when the agent ends, as the
     //    app starts agents: the space stays readable after a failure.
-    let shell = env.get("SHELL").cloned().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/zsh".into());
+    let shell = crate::env::shell_of(&env);
     let mut argv = vec!["/usr/bin/env".to_string()];
     let mut vars = a.env();
     vars.insert("HERDR_AUTOMATION".into(), a.name.clone());

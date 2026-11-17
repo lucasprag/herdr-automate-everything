@@ -134,7 +134,7 @@ fn run_script(a: &Automation, run: &mut Run) -> Result<()> {
 /// Starts `automate-everything _run ...` in its own session, so it outlives
 /// whoever started it (the scheduler restarting on a new binary, the panel).
 pub fn spawn(req: &Request) -> Result<std::process::Child> {
-    let exe = std::env::current_exe()?;
+    let exe = paths::current_exe()?;
     let mut cmd = Command::new(exe);
     cmd.arg("_run")
         .arg(&req.name)

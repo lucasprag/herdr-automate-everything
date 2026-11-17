@@ -134,7 +134,7 @@ fn open(
     labels.extend(parse_labels(raw_labels)?);
 
     let login = env::login_env();
-    let shell = login.get("SHELL").cloned().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/zsh".into());
+    let shell = env::shell_of(&login);
     let program = argv.first().map(|p| p.rsplit('/').next().unwrap_or(p).to_string());
     let full = if argv.is_empty() {
         vec![shell.clone(), "-li".into()]

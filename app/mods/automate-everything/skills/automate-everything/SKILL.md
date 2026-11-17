@@ -1,11 +1,11 @@
 ---
 name: automate-everything
-description: Scheduled scripts and agent runs on this Mac (automate-everything, the Herdr Automations panel), not Orca or cloud routines. Use to schedule something recurring here, to check on automations (is the scheduler up, what ran, why a run failed or was skipped), or to change one (schedule, prompt, pause, resume, run now, delete).
+description: Scheduled scripts and agent runs on this computer, macOS or Linux (automate-everything, the Herdr Automations panel), not Orca or cloud routines. Use to schedule something recurring here, to check on automations (is the scheduler up, what ran, why a run failed or was skipped), or to change one (schedule, prompt, pause, resume, run now, delete).
 ---
 
 # Automations
 
-One binary, `automate-everything`, owns the config, the scheduler (a launchd agent, so it fires with the app closed) and the run history. The Herdr Automations panel is only a view over the same CLI, so anything done here shows up there.
+One binary, `automate-everything`, owns the config, the scheduler (a launchd agent on macOS, a systemd user service on Linux, so it fires with the app closed) and the run history. The Herdr Automations panel is only a view over the same CLI, so anything done here shows up there.
 
 Act through the CLI. `set`, `pause`, `resume` and `delete` validate the whole entry before writing and rewrite only that entry, keeping the file's comments and order. Hand edits to the TOML also work, since the scheduler rereads it every minute, but run `check` after them.
 
@@ -27,7 +27,7 @@ What a run's status means:
 | `closed` | The user closed the run's space by hand. Not a failure. |
 | `skipped_precheck` | The precheck exited non-zero, so the scheduled run never started. |
 | `skipped_overlap` | A fire came while the previous run was still going. |
-| `missed` | A fire was later than `grace_minutes`, usually because the Mac was asleep. |
+| `missed` | A fire was later than `grace_minutes`, usually because the computer was asleep. |
 
 ## Creating and changing
 
