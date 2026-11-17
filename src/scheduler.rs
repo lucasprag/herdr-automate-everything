@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use anyhow::Result;
@@ -146,6 +148,30 @@ fn tick(st: &mut State) {
     save_cursors(&st.cursors);
 }
 
+/// Sends other machines their copies (`sync`) on a thread of its own, so a
+/// slow machine never holds up a fire; one send at a time.
+fn send_copies(sending: &Arc<AtomicBool>) {
+    if sending.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let sending = sending.clone();
+    std::thread::spawn(move || {
+        match crate::sync::send() {
+            Ok(outcomes) => {
+                for o in outcomes {
+                    match o.result {
+                        Some(Ok(n)) => log(&format!("sent `{}` its {n} automations", o.machine)),
+                        Some(Err(e)) => log(&format!("could not send `{}` its automations: {e:#}", o.machine)),
+                        None => {}
+                    }
+                }
+            }
+            Err(e) => log(&format!("could not work out what to send other machines: {e:#}")),
+        }
+        sending.store(false, Ordering::SeqCst);
+    });
+}
+
 fn trim_log() {
     let path = paths::scheduler_log();
     if let Ok(m) = std::fs::metadata(&path) {
@@ -174,30 +200,10 @@ pub fn serve() -> Result<()> {
     let mut st = State { cursors: load_cursors(), reported: HashMap::new(), config_error: None };
     let mut last_prune: Option<DateTime<Utc>> = None;
 
-    // Copies for other machines go out on a thread of their own, so a slow
-    // machine never holds up a fire.
-    let sending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sending = Arc::new(AtomicBool::new(false));
     loop {
         tick(&mut st);
-
-        if !sending.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            let sending = sending.clone();
-            std::thread::spawn(move || {
-                match crate::sync::send() {
-                    Ok(outcomes) => {
-                        for o in outcomes {
-                            match o.result {
-                                Some(Ok(n)) => log(&format!("sent `{}` its {n} automations", o.machine)),
-                                Some(Err(e)) => log(&format!("could not send `{}` its automations: {e:#}", o.machine)),
-                                None => {}
-                            }
-                        }
-                    }
-                    Err(e) => log(&format!("could not work out what to send other machines: {e:#}")),
-                }
-                sending.store(false, std::sync::atomic::Ordering::SeqCst);
-            });
-        }
+        send_copies(&sending);
 
         if last_prune.map(|t| Utc::now() - t > Duration::hours(1)).unwrap_or(true) {
             if let Ok(cfg) = config::load() {

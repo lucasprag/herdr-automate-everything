@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
-use crate::{hc, history};
+use crate::{hc, history, paths};
 
 /// What `--on` and `runs_on` need from the other side; reported by `status
 /// --json` as `protocol`. Older builds report none (0); 2 receives copies
@@ -128,7 +128,7 @@ fn run_detached(machine: &str, args: &[String]) -> Result<i32> {
         .skip_while(|a| a.as_str() != "run")
         .skip(1)
         .find(|a| !a.starts_with('-'))
-        .ok_or_else(|| anyhow!("run: which automation?"))?
+        .ok_or_else(|| anyhow!("run needs an automation name"))?
         .clone();
     let run_id = start_run(machine, &name)?;
     if json_out {
@@ -180,6 +180,67 @@ pub fn probe(machine: &str) -> Value {
                 "timezone": s["timezone"],
             })
         }
+    }
+}
+
+/// Fills in each connected machine's `automate_everything` (see `probe`),
+/// asking them all at once: each is a round trip, and an offline one isn't
+/// asked. Remembers what it found (`remember`).
+pub fn probe_all(machines: &mut [Value]) {
+    std::thread::scope(|s| {
+        let asks: Vec<_> = machines
+            .iter()
+            .map(|m| {
+                let name = m["name"].as_str().unwrap_or("").to_string();
+                let connected = m["state"] == "connected";
+                s.spawn(move || connected.then(|| probe(&name)))
+            })
+            .collect();
+        for (m, ask) in machines.iter_mut().zip(asks) {
+            m["automate_everything"] = ask.join().ok().flatten().unwrap_or(Value::Null);
+        }
+    });
+    remember(machines);
+}
+
+/// Machines seen running automate-everything, kept in the state folder so
+/// one that's offline now still shows up (`reachable: false`, `seen_at`)
+/// instead of vanishing. One answering without it, or removed from hc, is
+/// forgotten.
+fn remember(v: &mut [Value]) {
+    let path = paths::machines_cache();
+    let mut seen: serde_json::Map<String, Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let before = seen.clone();
+    // A machine removed from hc is forgotten too.
+    seen.retain(|name, _| v.iter().any(|m| m["name"].as_str() == Some(name)));
+    for m in v.iter_mut() {
+        let name = m["name"].as_str().unwrap_or("").to_string();
+        let ae = &mut m["automate_everything"];
+        if ae["installed"] == true {
+            ae["reachable"] = json!(true);
+            let mut keep = ae.clone();
+            keep["seen_at"] = json!(chrono::Utc::now().format("%Y-%m-%dT%H:%M:00Z").to_string());
+            ae["seen_at"] = keep["seen_at"].clone();
+            seen.insert(name, keep);
+        } else if ae["installed"] == false {
+            seen.remove(&name);
+        } else if let Some(last) = seen.get(&name) {
+            // Offline, or it didn't answer: what it ran when last seen.
+            let error = ae["error"].clone();
+            *ae = last.clone();
+            ae["reachable"] = json!(false);
+            ae["scheduler_running"] = Value::Null;
+            if !error.is_null() {
+                ae["error"] = error;
+            }
+        }
+    }
+    if seen != before {
+        let _ = paths::ensure_state_dirs();
+        let _ = std::fs::write(&path, serde_json::to_string_pretty(&seen).unwrap_or_default());
     }
 }
 

@@ -3,8 +3,9 @@
 // back as an error here and nothing is written.
 //
 // "Runs on" picks where: this Mac and/or machines running automate-everything
-// (`runs_on`), each of which gets a copy and fires it itself. A machine without automate-everything can still be picked on its
-// own: this Mac fires the run and it executes there through hc (`machine`).
+// (`runs_on`), each of which gets a copy and fires it itself. A machine
+// without automate-everything can still be picked on its own: this Mac fires
+// the run and it executes there through hc (`machine`).
 // An automation a machine defines itself is edited there (`--on`), without
 // "Runs on".
 
@@ -208,10 +209,7 @@ export class Edit {
         .border_1().border_color(on ? t.accent : t.input).bg(on ? t.selected : t.background)
         .text_size(12).text_color(on ? t.foreground : t.muted)
         .hover((s) => s.text_color(t.foreground))
-        .on_click((_e, cx) => {
-          this.choice[key] = value;
-          cx.notify();
-        })
+        .on_click((_e, cx) => { this.choice[key] = value; cx.notify(); })
         .child(label);
     }));
   }

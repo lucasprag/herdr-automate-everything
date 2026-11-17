@@ -311,18 +311,18 @@ pub fn validate(name: &str, entry: Entry) -> Result<Automation> {
     }
     for (i, p) in places.iter().enumerate() {
         if p != LOCAL && !valid_machine(p) {
-            bail!("runs_on: `{p}` is not `local` or a machine name (see `hc machine ls`)");
+            bail!("`runs_on` entry `{p}` is not `local` or a machine name (see `hc machine ls`)");
         }
         if places[..i].contains(p) {
-            bail!("runs_on lists `{p}` twice");
+            bail!("`runs_on` lists `{p}` twice");
         }
     }
     let here = places.iter().any(|p| p == LOCAL);
     if entry.machine.is_some() && places.len() > 1 {
-        bail!("`machine` (this machine fires it, it runs there) only goes with runs_on = [\"local\"]");
+        bail!("`machine` only applies with runs_on = [\"local\"] (this machine fires it, it runs there)");
     }
     if entry.machine.is_some() && !here {
-        bail!("`machine` and runs_on without `local`: list the machine in runs_on instead");
+        bail!("`machine` only applies with `local` in `runs_on`: list the machine in `runs_on` instead");
     }
     // Paths on another machine can only be checked there (`check` does).
     let local = entry.machine.is_none() && here;
@@ -686,7 +686,7 @@ mod tests {
         assert!(entry("runs_on = [\"local\", \"lab\"]").unwrap().1);
         assert!(entry("runs_on = []").unwrap_err().contains("empty"));
         assert!(entry("runs_on = [\"lab\", \"lab\"]").unwrap_err().contains("twice"));
-        assert!(entry("runs_on = [\"a/b\"]").unwrap_err().contains("not `local`"));
+        assert!(entry("runs_on = [\"a/b\"]").unwrap_err().contains("is not `local`"));
         // `machine` is this machine firing a run elsewhere: only with local alone.
         assert!(entry("runs_on = [\"lab\"]\nmachine = \"lab\"").is_err());
         assert!(entry("runs_on = [\"local\"]\nmachine = \"lab\"").is_ok());

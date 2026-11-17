@@ -15,6 +15,8 @@ const DISCOVER_MS = 5 * 60 * 1000;
 // While a machine has something running: there are no files here to watch for
 // its end, so it's asked this often until nothing is.
 const RUNNING_MS = 5000;
+// After an action on another machine: long enough for a run to have its record.
+const SETTLE_MS = 3000;
 const INSTALL_MS = 5 * 60 * 1000;
 const MOD_DIR = `${appHome()}/mods/automate-everything`;
 const OUTPUT_LINES = 400;
@@ -38,9 +40,11 @@ export class Panel {
     this.drag = null; // a row being dragged to a new place
     this.heights = new Map(); // row heights by name, for working out where a drag lands
     this.noClickUntil = 0;
-    // Machines whose own scheduler holds entries, by name: { items, runs,
-    // status, error, at (last answer), reachable, version, outdated }.
+    // Machines running automate-everything, by name: { items, runs, status,
+    // error, at (last answer), reachable, version, outdated }.
     this.remotes = new Map();
+    this.discovered = false; // whether this.remotes has been filled once
+    this.source = null; // how this Mac names itself to the machines it sends copies to
     // Self-install: download (or build) the binary, put it in ~/.local/bin,
     // keep the background service (launchd/systemd) running. Cheap when nothing changed.
     this.selfInstall(cx);
@@ -50,7 +54,8 @@ export class Panel {
     this.discover(cx);
     cx.timer.every(DISCOVER_MS, (cx) => this.discover(cx));
     cx.timer.every(REMOTE_MS, (cx) => this.refreshRemotes(cx));
-    // keys.json: "automate-everything.history", ".home", ".new", ".edit:<name>", ".menu:<name>".
+    // keys.json: "automate-everything.history", ".home", ".new", ".edit:<name>", ".menu:<name>",
+    // ".run:<id>" (each with "@<machine>" for a machine's own automation), ".refresh[:<machine>]".
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
@@ -112,7 +117,6 @@ export class Panel {
           const [items, st] = await Promise.all([cli.list(), cli.status()]);
           this.items = items;
           this.scheduler = st;
-          // How this Mac names itself to the machines it sends copies to.
           this.source = st.source_id ?? null;
           if (this.page !== "home") this.runs = await cli.history();
           if (this.page === "run" && this.detail && !this.detail.on) this.detail = await cli.show(this.detail.id);
@@ -126,7 +130,7 @@ export class Panel {
     });
   }
 
-  // ---- other machines ------------------------------------------------
+  // ---- other machines ---------------------------------------------------
   // An automation defined here can run on machines running automate-everything
   // (`runs_on`): each gets a copy and fires it itself. The panel shows one
   // line per automation defined here, with its copies' state folded in, plus
@@ -400,7 +404,7 @@ export class Panel {
       // once a run there has its record (or a copy has gone out).
       for (const m of new Set([on, ...also].filter(Boolean))) {
         this.refreshRemote(m, cx);
-        cx.timer.after(3000, (cx) => this.refreshRemote(m, cx));
+        cx.timer.after(SETTLE_MS, (cx) => this.refreshRemote(m, cx));
       }
     });
   }
@@ -637,7 +641,6 @@ export class Panel {
         this.field(t, "Status", word(r.status), tone(t, r.status)),
         this.field(t, "Trigger", r.trigger),
         this.field(t, "Machine", r.machine ?? r.on),
-
         this.field(t, "Scheduled", r.scheduled_for && new Date(r.scheduled_for).toLocaleString()),
         this.field(t, "Missed", r.missed_fires && `${r.missed_fires} fire(s), from ${new Date(r.first_missed).toLocaleString()}`),
         this.field(t, "Caught up", r.caught_up && `${r.caught_up} earlier fire(s)`),

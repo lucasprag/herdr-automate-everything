@@ -92,11 +92,10 @@ command line or by editing the config file.
 Agent automations need herdr-core (`hc`) and the agent (`claude`) on the PATH
 your login shell sets up; they haven't been tested on Linux yet.
 
-#### Running automations defined on your Mac
-
-If the Linux machine is a herdr-core machine your Mac knows (`hc machine ls`),
-define the automation on the Mac and add the machine to its `runs_on` (in the
-panel: **Runs on** in the edit form). The Mac sends the machine a copy, and
+**Running automations defined on your Mac.** If the Linux machine is a
+herdr-core machine your Mac knows (`hc machine ls`), define the automation on
+the Mac and add the machine to its `runs_on` (in the panel: **Runs on** in
+the edit form). The Mac sends the machine a copy, and
 the machine's own scheduler fires it, so it doesn't depend on the Mac being
 awake. See [Running on other machines](#running-on-other-machines).
 
@@ -176,15 +175,16 @@ Each automation has three buttons:
 To change the order, drag an automation up or down by the dotted handle on its left.
 
 **Runs on** in the edit form picks where an automation runs: this Mac and/or
-machines running automate-everything. Each of those fires its own copy with its
-own scheduler, whether or not this Mac is awake. Its line shows where it runs (`This Mac + lab`) and
-its last run wherever that was; a machine that can't be reached, or hasn't got
+machines running automate-everything. Each of those fires its own copy with
+its own scheduler, whether or not this Mac is awake. Its line shows where it
+runs (`This Mac + lab`) and its last run wherever that was; a machine that can't be reached, or hasn't got
 the latest copy yet, is said so under it. Automations a machine has in its own
 config show after this Mac's, marked "defined on lab", and a name defined in
 both places is flagged, since both fire.
 
-**History** lists every run, other machines' included. Click one to see what happened: when it ran, how
-long it took, its output and, for an agent, what was on its screen at the end.
+**History** lists every run, other machines' included. Click one to see what
+happened: when it ran, how long it took, its output and, for an agent, what
+was on its screen at the end.
 
 | Status | What it means |
 |---|---|
@@ -331,7 +331,7 @@ command = "uname -a; hostname"
   (add `--on lab` for one machine).
 - **Checking it:** a copy's paths and fields are judged on the machine, so
   `automate-everything check` asks each machine in a `runs_on` and reports
-  copies it can't run (`on `lab`: repo ... is not a folder`); the panel says
+  copies it can't run (``on `lab`: repo ... is not a folder``); the panel says
   so on the automation's line.
 - **A name in the machine's own config** wins over the copy; the copy shows as
   invalid there until one of them goes.
@@ -386,7 +386,8 @@ one's version.
   timeout stops it there. An agent's space shows under that machine. If the
   machine can't be reached, the run fails and says so. Scheduling stays on
   this Mac, so nothing runs while it sleeps; list the machine in `runs_on`
-  instead to have it fire its own copy ([Running on other machines](#running-on-other-machines)).
+  instead to have it fire its own copy
+  ([Running on other machines](#running-on-other-machines)).
 - **Catching up after sleep:** the newest missed time runs once if it's inside
   the grace window; otherwise one missed record covers them all. Daylight
   saving: a fixed-time automation runs once when clocks go back and isn't lost
@@ -428,7 +429,9 @@ until they close themselves, and the space closes with its last tab.
 ## Panel keys
 
 `keys.json` can send `automate-everything.history`, `.home`, `.new`,
-`.edit:<name>`, `.menu:<name>` and `.run:<run-id>` to the panel.
+`.edit:<name>`, `.menu:<name>` and `.run:<run-id>` to the panel. For an
+automation a machine defines itself, add `@<machine>`: `.edit:<name>@lab`.
+`.refresh` reloads the list, `.refresh:<machine>` that machine's part of it.
 
 ## Working on the mod
 

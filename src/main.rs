@@ -305,69 +305,45 @@ fn run_now(name: &str, wait: bool, json_out: bool, run_id: Option<String>, check
     }
     let machines: Vec<&String> = if here { Vec::new() } else { places.iter().filter(|p| *p != config::LOCAL).collect() };
     let local = here || places.iter().any(|p| p == config::LOCAL);
-    if !machines.is_empty() {
-        if wait {
-            match (local, machines.as_slice()) {
-                (false, [m]) => {
-                    let args: Vec<String> = ["run", name, "--wait"].iter().map(|s| s.to_string()).chain(json_out.then(|| "--json".to_string())).collect();
-                    std::process::exit(remote::proxy(m, &args)?);
-                }
-                _ => bail!("`{name}` runs in more than one place; --wait needs one: add --on <machine>, or run it without --wait"),
+    match (local, machines.as_slice()) {
+        (_, []) => run_here(name, wait, json_out, run_id),
+        (false, [m]) if wait => {
+            let mut args = vec!["run".to_string(), name.to_string(), "--wait".to_string()];
+            if json_out {
+                args.push("--json".into());
             }
+            std::process::exit(remote::proxy(m, &args)?);
         }
-        let mut runs = Vec::new();
-        let mut errors = Vec::new();
-        if local {
-            let req = runner::Request {
-                name: name.to_string(),
-                trigger: Trigger::Manual,
-                run_id: run_id.clone().unwrap_or_else(|| history::new_id(name)),
-                scheduled_for: None,
-                caught_up: None,
-            };
-            paths::ensure_state_dirs()?;
-            let mut child = runner::spawn(&req)?;
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            let _ = child.try_wait();
-            runs.push(json!({ "on": null, "run_id": req.run_id }));
-        }
-        // Asked once for all of them.
-        let listed = hc::machines();
-        for m in machines {
-            let ready = match &listed {
-                Ok(l) => remote::reachable_in(l, m),
-                Err(e) => Err(anyhow!("{e:#}")),
-            };
-            match ready.and_then(|_| remote::start_run(m, name)) {
-                Ok(id) => runs.push(json!({ "on": m, "run_id": id })),
-                Err(e) => errors.push(format!("{m}: {e:#}")),
-            }
-        }
-        if runs.is_empty() {
-            bail!("{}", errors.join("; "));
-        }
-        if json_out {
-            println!("{}", json!({ "run_id": runs[0]["run_id"], "runs": runs, "errors": errors }));
-        } else {
-            for r in &runs {
-                let on = r["on"].as_str().map(|m| format!(" on {m}")).unwrap_or_default();
-                println!("started {name}{on} ({})", r["run_id"].as_str().unwrap_or(""));
-            }
-            for e in &errors {
-                eprintln!("not started on {e}");
-            }
-        }
-        return Ok(());
+        _ if wait => bail!("`{name}` runs in more than one place; --wait needs one: add --on <machine>, or run it without --wait"),
+        _ => run_everywhere(name, local, &machines, run_id, json_out),
     }
-    let req = runner::Request {
+}
+
+/// A manual run of `name`, with the given id or a new one.
+fn manual(name: &str, run_id: Option<String>) -> runner::Request {
+    runner::Request {
         name: name.to_string(),
         trigger: Trigger::Manual,
         run_id: run_id.unwrap_or_else(|| history::new_id(name)),
         scheduled_for: None,
         caught_up: None,
-    };
+    }
+}
+
+/// Starts a run here in the background; its run id.
+fn start_here(name: &str, run_id: Option<String>) -> Result<String> {
+    let req = manual(name, run_id);
+    paths::ensure_state_dirs()?;
+    let mut child = runner::spawn(&req)?;
+    // Let it get going, so its record exists by the time we return.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let _ = child.try_wait();
+    Ok(req.run_id)
+}
+
+fn run_here(name: &str, wait: bool, json_out: bool, run_id: Option<String>) -> Result<()> {
     if wait {
-        let run = runner::execute(req)?;
+        let run = runner::execute(manual(name, run_id))?;
         if json_out {
             println!("{}", serde_json::to_string_pretty(&run)?);
         } else {
@@ -381,15 +357,47 @@ fn run_now(name: &str, wait: bool, json_out: bool, run_id: Option<String>, check
     if lock::is_held(&paths::automation_lock(name)) && !json_out {
         eprintln!("`{name}` is still running; this run will be recorded as skipped_overlap");
     }
-    paths::ensure_state_dirs()?;
-    let mut child = runner::spawn(&req)?;
-    // Let it get going, so its record exists by the time we return.
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    let _ = child.try_wait();
+    let run_id = start_here(name, run_id)?;
     if json_out {
-        println!("{}", json!({ "run_id": req.run_id }));
+        println!("{}", json!({ "run_id": run_id }));
     } else {
-        println!("started {} ({})", name, req.run_id);
+        println!("started {name} ({run_id})");
+    }
+    Ok(())
+}
+
+/// Starts it here (when `local`) and on each machine; says where it couldn't.
+fn run_everywhere(name: &str, local: bool, machines: &[&String], run_id: Option<String>, json_out: bool) -> Result<()> {
+    let mut runs = Vec::new();
+    let mut errors = Vec::new();
+    if local {
+        runs.push(json!({ "on": null, "run_id": start_here(name, run_id)? }));
+    }
+    // Asked once for all of them.
+    let listed = hc::machines();
+    for m in machines {
+        let ready = match &listed {
+            Ok(l) => remote::reachable_in(l, m),
+            Err(e) => Err(anyhow!("{e:#}")),
+        };
+        match ready.and_then(|_| remote::start_run(m, name)) {
+            Ok(id) => runs.push(json!({ "on": m, "run_id": id })),
+            Err(e) => errors.push(format!("{m}: {e:#}")),
+        }
+    }
+    if runs.is_empty() {
+        bail!("{}", errors.join("; "));
+    }
+    if json_out {
+        println!("{}", json!({ "run_id": runs[0]["run_id"], "runs": runs, "errors": errors }));
+    } else {
+        for r in &runs {
+            let on = r["on"].as_str().map(|m| format!(" on {m}")).unwrap_or_default();
+            println!("started {name}{on} ({})", r["run_id"].as_str().unwrap_or(""));
+        }
+        for e in &errors {
+            eprintln!("not started on {e}");
+        }
     }
     Ok(())
 }
@@ -701,21 +709,7 @@ fn machines(json_out: bool, probe: bool) -> Result<()> {
     let machines = hc::machines()?;
     let mut v: Vec<_> = machines.iter().map(|m| json!({ "name": m["name"], "state": m["state"] })).collect();
     if probe {
-        // All at once: each is a round trip, and an offline one isn't asked.
-        std::thread::scope(|s| {
-            let asks: Vec<_> = v
-                .iter()
-                .map(|m| {
-                    let name = m["name"].as_str().unwrap_or("").to_string();
-                    let connected = m["state"] == "connected";
-                    s.spawn(move || connected.then(|| remote::probe(&name)))
-                })
-                .collect();
-            for (m, ask) in v.iter_mut().zip(asks) {
-                m["automate_everything"] = ask.join().ok().flatten().unwrap_or(serde_json::Value::Null);
-            }
-        });
-        remember_machines(&mut v);
+        remote::probe_all(&mut v);
     }
     if json_out {
         println!("{}", serde_json::to_string_pretty(&v)?);
@@ -738,47 +732,6 @@ fn machines(json_out: bool, probe: bool) -> Result<()> {
         println!("{}  {}{extra}", m["name"].as_str().unwrap_or(""), m["state"].as_str().unwrap_or(""));
     }
     Ok(())
-}
-
-/// Machines seen running automate-everything, kept in the state folder so
-/// one that's offline now still shows up (`reachable: false`, `seen_at`)
-/// instead of vanishing. One answering without it, or removed from hc, is
-/// forgotten.
-fn remember_machines(v: &mut [serde_json::Value]) {
-    let path = paths::state_dir().join("machines.json");
-    let mut seen: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    let before = seen.clone();
-    // A machine removed from hc is forgotten too.
-    seen.retain(|name, _| v.iter().any(|m| m["name"].as_str() == Some(name)));
-    for m in v.iter_mut() {
-        let name = m["name"].as_str().unwrap_or("").to_string();
-        let ae = &mut m["automate_everything"];
-        if ae["installed"] == true {
-            ae["reachable"] = json!(true);
-            let mut keep = ae.clone();
-            keep["seen_at"] = json!(Utc::now().format("%Y-%m-%dT%H:%M:00Z").to_string());
-            ae["seen_at"] = keep["seen_at"].clone();
-            seen.insert(name, keep);
-        } else if ae["installed"] == false {
-            seen.remove(&name);
-        } else if let Some(last) = seen.get(&name) {
-            // Offline, or it didn't answer: what it ran when last seen.
-            let error = ae["error"].clone();
-            *ae = last.clone();
-            ae["reachable"] = json!(false);
-            ae["scheduler_running"] = serde_json::Value::Null;
-            if !error.is_null() {
-                ae["error"] = error;
-            }
-        }
-    }
-    if seen != before {
-        let _ = paths::ensure_state_dirs();
-        let _ = std::fs::write(&path, serde_json::to_string_pretty(&seen).unwrap_or_default());
-    }
 }
 
 /// Changes go to where an automation is defined: a copy another machine sent

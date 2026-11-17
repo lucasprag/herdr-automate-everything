@@ -70,6 +70,30 @@ pub fn login_env_cache() -> PathBuf {
     state_dir().join("login-env.json")
 }
 
+/// Copies of automations other machines sent this one, one file per sender.
+pub fn received_dir() -> PathBuf {
+    state_dir().join("received")
+}
+
+/// What this machine last sent each machine in a `runs_on`.
+pub fn sent_file() -> PathBuf {
+    state_dir().join("sent.json")
+}
+
+pub fn sync_lock() -> PathBuf {
+    state_dir().join("sync.lock")
+}
+
+/// The random tag in this machine's id as a sender.
+pub fn id_file() -> PathBuf {
+    state_dir().join("id")
+}
+
+/// Machines seen running automate-everything (`machines --probe`).
+pub fn machines_cache() -> PathBuf {
+    state_dir().join("machines.json")
+}
+
 pub fn ensure_state_dirs() -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let state = state_dir();

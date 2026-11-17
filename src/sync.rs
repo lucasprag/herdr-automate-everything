@@ -12,7 +12,6 @@
 //! one once it's back; its runs and history stay on it.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -23,16 +22,7 @@ use crate::lock::FileLock;
 use crate::{cron, paths, remote};
 
 /// How long a copy that hasn't changed goes before it's sent again.
-const RESEND: i64 = 30;
-
-/// Where the copies this machine was sent live, one file per sender.
-fn received_dir() -> PathBuf {
-    paths::state_dir().join("received")
-}
-
-fn sent_file() -> PathBuf {
-    paths::state_dir().join("sent.json")
-}
+const RESEND_MINUTES: i64 = 30;
 
 /// This machine, as it names itself to the machines it sends copies to: its
 /// short hostname, for people, plus a random tag made once and kept in the
@@ -43,13 +33,14 @@ pub fn source_id() -> String {
 }
 
 fn tag() -> String {
-    let path = paths::state_dir().join("id");
+    let path = paths::id_file();
     if let Ok(t) = std::fs::read_to_string(&path) {
         let t = t.trim();
         if t.len() == 8 && t.chars().all(|c| c.is_ascii_hexdigit()) {
             return t.to_string();
         }
     }
+    // Read the way `history::new_id` reads its random bytes.
     let mut bytes = [0u8; 4];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         use std::io::Read;
@@ -91,7 +82,7 @@ fn valid_source(s: &str) -> bool {
 
 /// The copies other machines sent: (sender, its config text).
 pub fn received() -> Vec<(String, String)> {
-    let Ok(dir) = std::fs::read_dir(received_dir()) else { return Vec::new() };
+    let Ok(dir) = std::fs::read_dir(paths::received_dir()) else { return Vec::new() };
     let mut out: Vec<(String, String)> = dir
         .flatten()
         .filter_map(|e| {
@@ -110,7 +101,7 @@ pub fn receive(source: &str, text: &str) -> Result<usize> {
         bail!("`{source}` is not a machine id");
     }
     let cfg = config::parse(text).context("the copy")?;
-    let path = received_dir().join(format!("{source}.toml"));
+    let path = paths::received_dir().join(format!("{source}.toml"));
     if cfg.slots.is_empty() {
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -119,7 +110,7 @@ pub fn receive(source: &str, text: &str) -> Result<usize> {
         }
         return Ok(0);
     }
-    std::fs::create_dir_all(received_dir())?;
+    std::fs::create_dir_all(paths::received_dir())?;
     let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, &path)?;
@@ -169,12 +160,12 @@ struct Sent {
 }
 
 fn load_sent() -> BTreeMap<String, Sent> {
-    std::fs::read_to_string(sent_file()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    std::fs::read_to_string(paths::sent_file()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
 
 fn save_sent(s: &BTreeMap<String, Sent>) {
     let _ = paths::ensure_state_dirs();
-    let _ = std::fs::write(sent_file(), serde_json::to_string_pretty(s).unwrap_or_default());
+    let _ = std::fs::write(paths::sent_file(), serde_json::to_string_pretty(s).unwrap_or_default());
 }
 
 /// FNV-1a: stable across builds, which `DefaultHasher` isn't.
@@ -205,7 +196,7 @@ pub fn send() -> Result<Vec<Outcome>> {
         return Ok(Vec::new());
     }
     paths::ensure_state_dirs()?;
-    let _lock = FileLock::acquire(&paths::state_dir().join("sync.lock"))?;
+    let _lock = FileLock::acquire(&paths::sync_lock())?;
     // Both read under the lock, so a send that waited for another never
     // sends an older config than the one that went before it.
     let copies = copies(&config::read_text()?, tz)?;
@@ -226,7 +217,7 @@ pub fn send() -> Result<Vec<Outcome>> {
         // The sender's id counts: under a new one, the machine needs it again.
         let h = hash(&format!("{source}\n{text}"));
         let last = sent.get(&m).cloned().unwrap_or_default();
-        let due = last.at.map(|t| now - t > Duration::minutes(RESEND)).unwrap_or(true);
+        let due = last.at.map(|t| now - t > Duration::minutes(RESEND_MINUTES)).unwrap_or(true);
         if last.hash == h && last.error.is_none() && !due {
             out.push(Outcome { machine: m, result: None });
             continue;
