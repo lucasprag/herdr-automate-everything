@@ -37,6 +37,76 @@ From then on it runs by itself. To update, `git pull` and run
 `scripts/install-mod.sh` again; the panel installs the new program within
 5 minutes.
 
+### On Linux, without the Herdr app
+
+The scheduler, script automations and the command line also run on Linux
+(tested on Ubuntu), as a systemd user service instead of a launchd agent. You
+don't need the Herdr app for script automations; you configure them with the
+command line or by editing the config file.
+
+1. Get the program into `~/.local/bin`, either the release binary for your
+   machine (static, so it runs on any distro):
+
+   ```sh
+   arch=$(uname -m)   # x86_64 or aarch64
+   mkdir -p ~/.local/bin && cd ~/.local/bin
+   curl -fsSLO https://github.com/lucasprag/herdr-automate-everything/releases/latest/download/automate-everything-linux-$arch
+   curl -fsSLO https://github.com/lucasprag/herdr-automate-everything/releases/latest/download/automate-everything-linux-$arch.sha256
+   sha256sum -c automate-everything-linux-$arch.sha256 && mv automate-everything-linux-$arch automate-everything && chmod +x automate-everything
+   ```
+
+   or a build of this repo (needs [rustup.rs](https://rustup.rs)):
+
+   ```sh
+   cargo build --release && cp .target/release/automate-everything ~/.local/bin/
+   ```
+
+2. Install and start the service, then check on it:
+
+   ```sh
+   automate-everything service install
+   automate-everything status
+   ```
+
+   This writes `com.lucasprag.automate-everything.service` in
+   `$XDG_CONFIG_HOME/systemd/user/` (`~/.config/systemd/user/` by default)
+   and enables it with `systemctl --user`. It needs systemd 240 or newer with a
+   user instance; on WSL without systemd, or OpenRC/runit distros, keep
+   `automate-everything scheduler` running some other way.
+
+3. A systemd user service stops when you log out, unless lingering is on for
+   your user. `status` (and `service install`) warn when it's off; turn it on
+   with:
+
+   ```sh
+   loginctl enable-linger $USER
+   ```
+
+4. Add an automation and try it:
+
+   ```sh
+   automate-everything set hello --create --fields '{"kind":"script","schedule":"*/5 * * * *","command":"date"}'
+   automate-everything run hello --wait
+   ```
+
+Agent automations need herdr-core (`hc`) and the agent (`claude`) on the PATH
+your login shell sets up; they haven't been tested on Linux yet.
+
+**Running automations defined on your Mac.** If the Linux machine is a
+herdr-core machine your Mac knows (`hc machine ls`), define the automation on
+the Mac and add the machine to its `runs_on` (in the panel: **Runs on** in
+the edit form). The Mac sends the machine a copy, and
+the machine's own scheduler fires it, so it doesn't depend on the Mac being
+awake. See [Running on other machines](#running-on-other-machines).
+
+`--on` runs any command there, for a look at its own state:
+
+```sh
+automate-everything machines --probe            # which machines run it, and which version
+automate-everything --on lab list
+automate-everything --on lab history hello
+```
+
 ## What's in this repo
 
 | Path | What it is |
@@ -89,7 +159,7 @@ day of the week.
 
 Times are in your computer's timezone unless you set another one.
 
-If your Mac was asleep when an automation was due, it runs once when the Mac
+If your computer was asleep when an automation was due, it runs once when it
 wakes up, as long as that's within 10 minutes of the scheduled time (you can
 change that with **Grace**). Otherwise the run is recorded as missed and waits
 for its next time.
@@ -104,8 +174,17 @@ Each automation has three buttons:
 
 To change the order, drag an automation up or down by the dotted handle on its left.
 
-**History** lists every run. Click one to see what happened: when it ran, how
-long it took, its output and, for an agent, what was on its screen at the end.
+**Runs on** in the edit form picks where an automation runs: this Mac and/or
+machines running automate-everything. Each of those fires its own copy with
+its own scheduler, whether or not this Mac is awake. Its line shows where it
+runs (`This Mac + lab`) and its last run wherever that was; a machine that can't be reached, or hasn't got
+the latest copy yet, is said so under it. Automations a machine has in its own
+config show after this Mac's, marked "defined on lab", and a name defined in
+both places is flagged, since both fire.
+
+**History** lists every run, other machines' included. Click one to see what
+happened: when it ran, how long it took, its output and, for an agent, what
+was on its screen at the end.
 
 | Status | What it means |
 |---|---|
@@ -115,7 +194,7 @@ long it took, its output and, for an agent, what was on its screen at the end.
 | closed | You closed the agent's space yourself. |
 | skipped precheck | The precheck said there was nothing to do. |
 | skipped overlap | The previous run was still going, so this one didn't start. |
-| missed | The Mac was asleep or off at the scheduled time. |
+| missed | The computer was asleep or off at the scheduled time. |
 
 ## Asking your agent
 
@@ -142,7 +221,8 @@ command line, or work on the mod itself.
 - **`automate-everything`**, a Rust program (`src/`), does the real work: it
   keeps the schedule, starts the runs, stores the config and the history, and
   has a command line for all of it. It runs as a background service (a launchd
-  agent), which is why automations fire with the app closed.
+  agent on macOS, a systemd user service on Linux), which is why automations
+  fire with the app closed.
 - **The Automations panel** (`app/mods/automate-everything/`) is a view on
   top of that program. Anything you do in the panel goes through the command
   line, so the two always agree.
@@ -157,6 +237,11 @@ log is `~/.config/herdr-app/mods/automate-everything/.target/install.log`.
 
 To uninstall the background service: `automate-everything service uninstall`.
 
+On Linux the release binary is static (musl), so it reads `/etc/passwd`
+directly and doesn't see directory users (LDAP, SSSD). If you're one and the
+service starts without `$SHELL`, runs use `/bin/sh` for the login environment;
+build from source instead to use your system's NSS.
+
 Requirements: [docs/requirements.md](docs/requirements.md).
 
 ## Where things live
@@ -165,8 +250,9 @@ Requirements: [docs/requirements.md](docs/requirements.md).
 |---|---|
 | Config | `~/.config/automate-everything/automations.toml` |
 | History, locks, logs | `~/.local/state/automate-everything/` (`runs/<id>/run.json`, `stdout.log`, `stderr.log`, `agent.log`) |
-| Background service | `~/Library/LaunchAgents/com.lucasprag.automate-everything.plist` |
-| Worktrees | `~/.herdr/worktrees/<repo>/automation/<name>/<stamp>` |
+| Copies other machines sent | `~/.local/state/automate-everything/received/<machine>.toml` (and `sent.json`: what this one sent) |
+| Background service | macOS: `~/Library/LaunchAgents/com.lucasprag.automate-everything.plist`; Linux: `$XDG_CONFIG_HOME/systemd/user/com.lucasprag.automate-everything.service` (default `~/.config`) |
+| Worktrees | `~/.herdr/worktrees/<repo>/automation/<name>/<stamp>` (on the run's machine) |
 
 ## Config file
 
@@ -186,6 +272,7 @@ schedule = "30 8-15 * * 1-5"   # cron, 5 fields; @hourly/@daily/@weekly too
 timezone = "America/Toronto"   # default: this computer's
 grace_minutes = 10             # a fire missed by more than this is recorded as missed
 paused = false
+runs_on = ["local"]            # where: local and/or machines, each fires its own copy (default: local)
 command = "~/bin/hello --loud" # run by /bin/sh with your login environment
 cwd = "~/Projects"             # default: home
 timeout_seconds = 3600
@@ -211,6 +298,58 @@ timeout_seconds = 10800
 Every run gets the environment variables `HERDR_AUTOMATION`,
 `HERDR_AUTOMATION_RUN_ID` and `HERDR_AUTOMATION_TRIGGER` (`scheduled` or
 `manual`).
+
+### Running on other machines
+
+`runs_on` lists where an automation runs: `local` (this machine) and/or
+herdr-core machines (`hc machine ls`) that run automate-everything with its
+service. Each machine gets a copy of the automations meant for it and fires
+them with its own scheduler, so they don't depend on this Mac being awake. You
+define and change them here; the copy can't be changed there.
+
+```toml
+[automations.lab-probe]
+kind = "script"
+schedule = "*/30 * * * *"
+runs_on = ["lab"]              # default: ["local"]; both: ["local", "lab"]
+command = "uname -a; hostname"
+```
+
+- **Paths and environment are the machine's**: `command`, `cwd`, `repo`,
+  `precheck` and `prompt_file` resolve there, `~` being its home, with its own
+  login environment.
+- **Its runs and history stay on the machine.** The panel shows them with this
+  Mac's; from the terminal, `automate-everything --on lab history lab-probe`.
+- **Copies go out right after a change** (from the panel or the command line)
+  and the scheduler checks every minute, so hand edits follow within a
+  minute. A machine that's offline keeps running its last copy and gets the new
+  one when it's back. A machine only ever holds the whole current set, so
+  dropping it from `runs_on` removes its copy.
+- **An empty `timezone` means this Mac's**: it's written into the copy, so the
+  schedule means the same on every machine.
+- **Run now** runs it everywhere it runs; `run --wait` needs a single place
+  (add `--on lab` for one machine).
+- **Checking it:** a copy's paths and fields are judged on the machine, so
+  `automate-everything check` asks each machine in a `runs_on` and reports
+  copies it can't run (``on `lab`: repo ... is not a folder``); the panel says
+  so on the automation's line.
+- **A name in the machine's own config** wins over the copy; the copy shows as
+  invalid there until one of them goes.
+
+`machine` is the other way to reach a machine, for one without
+automate-everything: this Mac fires the run and it executes there through hc,
+so nothing runs while this Mac sleeps. It goes with `runs_on` unset (or just
+`local`).
+
+```toml
+machine = "box"                # this Mac fires it, it runs on box
+```
+
+`--on <machine>` runs any command against a machine's own config and history
+(`hc exec`). It never waits on an offline machine: one hc doesn't show as
+connected fails at once, and calls time out after 10 s (30 s for changes). The
+machine needs a release that receives copies; `machines --probe` shows each
+one's version.
 
 ## How runs behave, in detail
 
@@ -242,6 +381,13 @@ Every run gets the environment variables `HERDR_AUTOMATION`,
 - **One run at a time** per automation, held by a lock for as long as the run
   lasts, a blocked one included. A scheduled time that comes up meanwhile is
   recorded as skipped overlap.
+- **On another machine** the run gets that machine's login environment, not
+  this Mac's. A script's output comes back into its record as usual, and a
+  timeout stops it there. An agent's space shows under that machine. If the
+  machine can't be reached, the run fails and says so. Scheduling stays on
+  this Mac, so nothing runs while it sleeps; list the machine in `runs_on`
+  instead to have it fire its own copy
+  ([Running on other machines](#running-on-other-machines)).
 - **Catching up after sleep:** the newest missed time runs once if it's inside
   the grace window; otherwise one missed record covers them all. Daylight
   saving: a fixed-time automation runs once when clocks go back and isn't lost
@@ -254,10 +400,12 @@ automate-everything list | run <name> [--wait] | pause <name> | resume <name> | 
 automate-everything move <name> --to <position>
 automate-everything history [<name>] | show <run-id>
 automate-everything get <name> | set <name> --fields '<json>' [--create] | check
-automate-everything status | service install|uninstall|restart | scheduler
+automate-everything status | machines [--probe] | service install|uninstall|restart | scheduler
+automate-everything --on <machine> <any of the above>
 ```
 
-Add `--json` to `list`, `history` and `show` for machine-readable output.
+Add `--json` to `list`, `history`, `show`, `check` and `machines` for
+machine-readable output. `delete --keep-history` removes only the entry.
 
 ### Extra tabs from an agent run
 
@@ -281,7 +429,9 @@ until they close themselves, and the space closes with its last tab.
 ## Panel keys
 
 `keys.json` can send `automate-everything.history`, `.home`, `.new`,
-`.edit:<name>`, `.menu:<name>` and `.run:<run-id>` to the panel.
+`.edit:<name>`, `.menu:<name>` and `.run:<run-id>` to the panel. For an
+automation a machine defines itself, add `@<machine>`: `.edit:<name>@lab`.
+`.refresh` reloads the list, `.refresh:<machine>` that machine's part of it.
 
 ## Working on the mod
 
@@ -314,7 +464,8 @@ git tag v0.2.0 && git push origin main v0.2.0
 
 The release workflow (`.github/workflows/release.yml`) checks the tag matches
 both versions, builds for Apple Silicon and Intel, joins them into one universal
-binary and attaches it and its checksum to a GitHub release. Everyone's panel
+binary, builds static Linux binaries for x86_64 and aarch64, and attaches them
+and their checksums to a GitHub release. Everyone's panel
 picks it up within 5 minutes of them pulling and running
 `scripts/install-mod.sh`.
 
@@ -330,15 +481,9 @@ doesn't, open an issue and say what you expected. That alone helps.
 
 Some bigger things that would be great to have:
 
-- **Linux support.** The scheduler runs as a launchd agent (`src/service.rs`)
-  and releases are macOS-only (`.github/workflows/release.yml`). Linux would
-  need a systemd user unit instead, and Linux builds in the release.
-- **Windows support.** Same idea with a Windows service or Task Scheduler,
-  plus Windows builds. Agent runs go through herdr-core, which also runs on
+- **Windows support.** A Windows service or Task Scheduler next to launchd
+  and systemd (`src/service/`), plus Windows builds. Agent runs go through herdr-core, which also runs on
   Windows.
-- **Automations on another machine.** herdr-core can run terminals on other
-  machines (`hc run --on <machine>`), so an automation could pick where it
-  runs.
 
 You don't need Rust to make a difference here. The panel is plain JavaScript
 (`app/mods/automate-everything/`: `panel.js`, `edit.js`, `popups.js`) and Herdr

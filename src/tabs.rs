@@ -134,7 +134,7 @@ fn open(
     labels.extend(parse_labels(raw_labels)?);
 
     let login = env::login_env();
-    let shell = login.get("SHELL").cloned().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/zsh".into());
+    let shell = env::shell_of(&login);
     let program = argv.first().map(|p| p.rsplit('/').next().unwrap_or(p).to_string());
     let full = if argv.is_empty() {
         vec![shell.clone(), "-li".into()]
@@ -143,9 +143,9 @@ fn open(
         v.extend(argv);
         v
     };
-    let terminal = hc::launch(&hc::Launch { cwd: &cwd, labels, argv: full })?;
+    let terminal = hc::launch(&hc::Launch { on: None, cwd: &cwd, labels, argv: full, keep: true, rm: false })?;
     let named = match &new_space {
-        Some(space_name) => hc::name_space_and_tab(&space, space_name, &cwd, &tab, name, &terminal),
+        Some(space_name) => hc::name_space_and_tab(None, &space, space_name, &cwd, &tab, name, &terminal),
         None => hc::name_tab(&space, &tab, name, &terminal),
     }
     .err()
@@ -269,6 +269,6 @@ fn forget_if_empty(t: &Value) {
     std::thread::sleep(Duration::from_millis(500));
     let Ok(left) = hc::live_with_labels(&[("herdr.tab", &tab)]) else { return };
     if left.is_empty() {
-        let _ = hc::forget_tab(&space, &tab);
+        let _ = hc::forget_tab(None, &space, &tab);
     }
 }

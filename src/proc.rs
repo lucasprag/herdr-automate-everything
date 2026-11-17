@@ -1,5 +1,8 @@
-//! Running programs with a timeout. Each program leads its own process group,
-//! so a timeout stops it and everything it started.
+//! Running programs with a timeout. Each program leads its own session (and
+//! so its own process group), so a timeout stops it and everything it
+//! started, and it never has a terminal: run from one (a run started with
+//! `--on`), an interactive login shell would otherwise be stopped for
+//! reading it in the background.
 
 use std::fs::File;
 use std::io::Read;
@@ -22,6 +25,17 @@ pub struct Captured {
     pub signal: Option<i32>,
     pub timed_out: bool,
     pub duration: Duration,
+}
+
+/// A new session with `cmd` as its leader: its own process group, no
+/// controlling terminal.
+fn own_session(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
 }
 
 fn kill_group(child: &Child, sig: i32) {
@@ -67,10 +81,8 @@ fn split_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
 
 /// Runs to completion with stdout and stderr going to files.
 pub fn run_to_files(mut cmd: Command, stdout: &Path, stderr: &Path, timeout: Duration) -> std::io::Result<Outcome> {
-    cmd.stdin(Stdio::null())
-        .stdout(File::create(stdout)?)
-        .stderr(File::create(stderr)?)
-        .process_group(0);
+    cmd.stdin(Stdio::null()).stdout(File::create(stdout)?).stderr(File::create(stderr)?);
+    own_session(&mut cmd);
     let mut child = cmd.spawn()?;
     let (status, timed_out) = wait_with_timeout(&mut child, timeout)?;
     let (exit_code, signal) = split_status(status);
@@ -90,7 +102,8 @@ fn reader<R: Read + Send + 'static>(mut r: R) -> mpsc::Receiver<Vec<u8>> {
 /// Runs to completion and captures its output in memory.
 pub fn output_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<Captured> {
     let start = Instant::now();
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    own_session(&mut cmd);
     if cmd.get_program().is_empty() {
         return Err(std::io::Error::other("empty command"));
     }

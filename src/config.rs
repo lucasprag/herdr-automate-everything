@@ -13,6 +13,7 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
 use crate::cron::{system_tz, Cron};
+use crate::host::Host;
 use crate::lock::FileLock;
 use crate::paths;
 
@@ -69,6 +70,12 @@ pub struct Entry {
     pub paused: Option<bool>,
     pub timeout_seconds: Option<u64>,
     pub env: Option<BTreeMap<String, String>>,
+    /// An hc machine (`hc machine ls`) the run executes on; unset = this Mac.
+    pub machine: Option<String>,
+    /// Where it's scheduled and run: `local` (this machine's scheduler) and/or
+    /// machines running automate-everything, each of which gets a copy and
+    /// fires it itself. Unset = `["local"]`.
+    pub runs_on: Option<Vec<String>>,
 
     // script
     pub command: Option<String>,
@@ -96,6 +103,9 @@ pub struct Automation {
     pub kind: Kind,
     pub cron: Cron,
     pub tz: Tz,
+    /// Set on a copy another machine sent (`sync`): that machine's id. It's
+    /// defined, and changed, there.
+    pub origin: Option<String>,
 }
 
 impl Automation {
@@ -136,21 +146,34 @@ impl Automation {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| self.name.clone())
     }
-    pub fn repo(&self) -> Option<PathBuf> {
-        self.entry.repo.as_deref().map(paths::expand)
+    /// The machine it runs on; None for this Mac.
+    pub fn machine(&self) -> Option<&str> {
+        self.entry.machine.as_deref()
     }
-    /// The script's working directory: `cwd`, else home.
-    pub fn script_cwd(&self) -> PathBuf {
-        self.entry.cwd.as_deref().map(paths::expand).unwrap_or_else(paths::home)
+    /// Where it runs: `local` and/or machines (see `Entry::runs_on`).
+    pub fn runs_on(&self) -> Vec<String> {
+        runs_on_of(&self.entry.runs_on)
     }
-    /// The prompt text: `prompt`, else the contents of `prompt_file`.
-    pub fn prompt_text(&self) -> Result<String> {
+    /// Whether this machine's scheduler fires it.
+    pub fn runs_here(&self) -> bool {
+        self.runs_on().iter().any(|p| p == LOCAL)
+    }
+    /// The repo, on the machine it runs on.
+    pub fn repo(&self, host: &Host) -> Option<PathBuf> {
+        self.entry.repo.as_deref().map(|r| host.expand(r))
+    }
+    /// The script's working directory: `cwd`, else home, on the machine it runs on.
+    pub fn script_cwd(&self, host: &Host) -> PathBuf {
+        self.entry.cwd.as_deref().map(|c| host.expand(c)).unwrap_or_else(|| host.home())
+    }
+    /// The prompt text: `prompt`, else the contents of `prompt_file`, read on
+    /// the machine it runs on.
+    pub fn prompt_text(&self, host: &Host) -> Result<String> {
         if let Some(p) = &self.entry.prompt {
             return Ok(p.clone());
         }
         let file = self.entry.prompt_file.as_deref().ok_or_else(|| anyhow!("no prompt"))?;
-        let path = paths::expand(file);
-        std::fs::read_to_string(&path).with_context(|| format!("reading prompt_file {}", path.display()))
+        host.read_to_string(&host.expand(file)).context("reading prompt_file")
     }
 }
 
@@ -160,7 +183,19 @@ pub struct Invalid {
     pub error: String,
     pub kind: Option<String>,
     pub schedule: Option<String>,
+    pub machine: Option<String>,
     pub paused: bool,
+    pub origin: Option<String>,
+}
+
+/// In `runs_on`: this machine.
+pub const LOCAL: &str = "local";
+
+pub fn runs_on_of(v: &Option<Vec<String>>) -> Vec<String> {
+    match v {
+        Some(v) if !v.is_empty() => v.clone(),
+        _ => vec![LOCAL.to_string()],
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +209,13 @@ impl Slot {
         match self {
             Slot::Valid(a) => &a.name,
             Slot::Invalid(i) => &i.name,
+        }
+    }
+    /// The machine that sent this copy; None for an entry of this machine's config.
+    pub fn origin(&self) -> Option<&str> {
+        match self {
+            Slot::Valid(a) => a.origin.as_deref(),
+            Slot::Invalid(i) => i.origin.as_deref(),
         }
     }
 }
@@ -209,6 +251,12 @@ pub fn valid_name(name: &str) -> bool {
         && !name.starts_with('.')
 }
 
+/// What hc accepts as a machine name: no spaces, no `/` (it separates the
+/// machine from the terminal in an address).
+pub fn valid_machine(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && !name.chars().any(|c| c.is_whitespace() || c == '/' || c.is_control())
+}
+
 const AGENT_ONLY: &[&str] = &[
     "agent", "model", "agent_args", "repo", "prompt", "prompt_file", "directory", "base_branch", "space",
     "space_name", "precheck", "precheck_timeout_seconds",
@@ -217,9 +265,9 @@ const SCRIPT_ONLY: &[&str] = &["command", "cwd"];
 
 /// The order new fields are written in.
 const FIELD_ORDER: &[&str] = &[
-    "kind", "description", "schedule", "timezone", "grace_minutes", "paused", "command", "cwd", "agent", "model",
-    "agent_args", "repo", "directory", "base_branch", "space", "space_name", "prompt", "prompt_file", "precheck",
-    "precheck_timeout_seconds", "timeout_seconds", "env",
+    "kind", "description", "schedule", "timezone", "grace_minutes", "paused", "runs_on", "machine", "command", "cwd", "agent",
+    "model", "agent_args", "repo", "directory", "base_branch", "space", "space_name", "prompt", "prompt_file",
+    "precheck", "precheck_timeout_seconds", "timeout_seconds", "env",
 ];
 
 fn set_fields(entry: &Entry) -> Vec<&'static str> {
@@ -252,6 +300,32 @@ pub fn validate(name: &str, entry: Entry) -> Result<Automation> {
             }
         }
     }
+    if let Some(m) = &entry.machine {
+        if !valid_machine(m) {
+            bail!("machine `{m}` is not a machine name (see `hc machine ls`)");
+        }
+    }
+    let places = runs_on_of(&entry.runs_on);
+    if entry.runs_on.as_ref().is_some_and(|v| v.is_empty()) {
+        bail!("`runs_on` is empty: list `local` and/or machines");
+    }
+    for (i, p) in places.iter().enumerate() {
+        if p != LOCAL && !valid_machine(p) {
+            bail!("`runs_on` entry `{p}` is not `local` or a machine name (see `hc machine ls`)");
+        }
+        if places[..i].contains(p) {
+            bail!("`runs_on` lists `{p}` twice");
+        }
+    }
+    let here = places.iter().any(|p| p == LOCAL);
+    if entry.machine.is_some() && places.len() > 1 {
+        bail!("`machine` only applies with runs_on = [\"local\"] (this machine fires it, it runs there)");
+    }
+    if entry.machine.is_some() && !here {
+        bail!("`machine` only applies with `local` in `runs_on`: list the machine in `runs_on` instead");
+    }
+    // Paths on another machine can only be checked there (`check` does).
+    let local = entry.machine.is_none() && here;
     let fields = set_fields(&entry);
     match kind {
         Kind::Script => {
@@ -262,7 +336,7 @@ pub fn validate(name: &str, entry: Entry) -> Result<Automation> {
                 Some(c) if !c.trim().is_empty() => {}
                 _ => bail!("a script automation needs `command`"),
             }
-            if let Some(cwd) = &entry.cwd {
+            if let (true, Some(cwd)) = (local, &entry.cwd) {
                 let p = paths::expand(cwd);
                 if !p.is_dir() {
                     bail!("cwd `{}` is not a folder", p.display());
@@ -275,14 +349,14 @@ pub fn validate(name: &str, entry: Entry) -> Result<Automation> {
             }
             let repo = entry.repo.as_deref().ok_or_else(|| anyhow!("an agent automation needs `repo`"))?;
             let rp = paths::expand(repo);
-            if !rp.is_dir() {
+            if local && !rp.is_dir() {
                 bail!("repo `{}` is not a folder", rp.display());
             }
             match (&entry.prompt, &entry.prompt_file) {
                 (Some(_), Some(_)) => bail!("set `prompt` or `prompt_file`, not both"),
                 (None, None) => bail!("an agent automation needs `prompt` or `prompt_file`"),
                 (Some(p), None) if p.trim().is_empty() => bail!("`prompt` is empty"),
-                (None, Some(f)) => {
+                (None, Some(f)) if local => {
                     let p = paths::expand(f);
                     if !p.is_file() {
                         bail!("prompt_file `{}` does not exist", p.display());
@@ -298,7 +372,7 @@ pub fn validate(name: &str, entry: Entry) -> Result<Automation> {
             }
         }
     }
-    Ok(Automation { name: name.to_string(), entry, kind, cron, tz })
+    Ok(Automation { name: name.to_string(), entry, kind, cron, tz, origin: None })
 }
 
 fn str_field(v: &toml::Value, key: &str) -> Option<String> {
@@ -334,7 +408,9 @@ pub fn parse(text: &str) -> Result<Config> {
                     error: format!("{e:#}"),
                     kind: str_field(value, "kind"),
                     schedule: str_field(value, "schedule"),
+                    machine: str_field(value, "machine"),
                     paused,
+                    origin: None,
                 }),
             });
         }
@@ -351,8 +427,43 @@ pub fn read_text() -> Result<String> {
     }
 }
 
+/// This machine's config plus the copies other machines sent it (`sync`).
 pub fn load() -> Result<Config> {
-    parse(&read_text()?)
+    let mut cfg = parse(&read_text()?)?;
+    for (origin, text) in crate::sync::received() {
+        let theirs = match parse(&text) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::scheduler::log(&format!("ignoring the copy from `{origin}`: {e:#}"));
+                continue;
+            }
+        };
+        for mut slot in theirs.slots {
+            if let Some(other) = cfg.find(slot.name()) {
+                // This machine's own entry (or the first copy) wins; this one shows why it doesn't run.
+                let name = slot.name().to_string();
+                let error = match other.origin() {
+                    None => format!("this machine's own config also has `{name}`: remove one of them"),
+                    Some(o) => format!("`{o}` also sends `{name}`: remove it from one of them"),
+                };
+                slot = Slot::Invalid(Invalid {
+                    error,
+                    name,
+                    kind: None,
+                    schedule: None,
+                    machine: None,
+                    paused: false,
+                    origin: None,
+                });
+            }
+            match &mut slot {
+                Slot::Valid(a) => a.origin = Some(origin.clone()),
+                Slot::Invalid(i) => i.origin = Some(origin.clone()),
+            }
+            cfg.slots.push(slot);
+        }
+    }
+    Ok(cfg)
 }
 
 const HEADER: &str = "\
@@ -562,6 +673,26 @@ mod tests {
     }
 
     #[test]
+    fn runs_on_lists_local_and_machines() {
+        let entry = |extra: &str| {
+            let text = format!("[automations.x]\nkind = \"script\"\nschedule = \"* * * * *\"\ncommand = \"true\"\n{extra}");
+            match parse(&text).unwrap().slots.remove(0) {
+                Slot::Valid(a) => Ok((a.runs_on(), a.runs_here())),
+                Slot::Invalid(i) => Err(i.error),
+            }
+        };
+        assert_eq!(entry("").unwrap(), (vec!["local".to_string()], true));
+        assert_eq!(entry("runs_on = [\"lab\"]").unwrap(), (vec!["lab".to_string()], false));
+        assert!(entry("runs_on = [\"local\", \"lab\"]").unwrap().1);
+        assert!(entry("runs_on = []").unwrap_err().contains("empty"));
+        assert!(entry("runs_on = [\"lab\", \"lab\"]").unwrap_err().contains("twice"));
+        assert!(entry("runs_on = [\"a/b\"]").unwrap_err().contains("is not `local`"));
+        // `machine` is this machine firing a run elsewhere: only with local alone.
+        assert!(entry("runs_on = [\"lab\"]\nmachine = \"lab\"").is_err());
+        assert!(entry("runs_on = [\"local\"]\nmachine = \"lab\"").is_ok());
+    }
+
+    #[test]
     fn invalid_entry_does_not_hide_others() {
         let c = parse(
             r#"
@@ -594,5 +725,58 @@ comand = "true"
     fn script_rejects_agent_fields() {
         let c = parse("[automations.x]\nkind='script'\nschedule='* * * * *'\ncommand='true'\nprompt='hi'\n").unwrap();
         assert!(matches!(c.find("x"), Some(Slot::Invalid(_))));
+    }
+
+    #[test]
+    fn machine_is_optional_for_both_kinds() {
+        let c = parse(
+            r#"
+[automations.here]
+kind = "script"
+schedule = "* * * * *"
+command = "true"
+
+[automations.script]
+kind = "script"
+schedule = "* * * * *"
+command = "uname -a"
+cwd = "/only/on/lab"
+machine = "lab"
+
+[automations.agent]
+kind = "agent"
+schedule = "* * * * *"
+repo = "~/only/on/lab"
+prompt_file = "~/only/on/lab.md"
+machine = "lab"
+"#,
+        )
+        .unwrap();
+        let machine = |n: &str| match c.find(n) {
+            Some(Slot::Valid(a)) => a.machine().map(String::from),
+            Some(Slot::Invalid(i)) => panic!("{n}: {}", i.error),
+            None => panic!("{n} missing"),
+        };
+        assert_eq!(machine("here"), None);
+        assert_eq!(machine("script").as_deref(), Some("lab"));
+        assert_eq!(machine("agent").as_deref(), Some("lab"));
+    }
+
+    #[test]
+    fn local_paths_are_still_checked() {
+        let c = parse("[automations.x]\nkind='script'\nschedule='* * * * *'\ncommand='true'\ncwd='/no/such/dir'\n").unwrap();
+        match c.find("x") {
+            Some(Slot::Invalid(i)) => assert!(i.error.contains("not a folder"), "{}", i.error),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn bad_machine_names_are_invalid() {
+        for m in ["\"\"", "\"a b\"", "\"lab/t1\"", "3"] {
+            let c = parse(&format!("[automations.x]\nkind='script'\nschedule='* * * * *'\ncommand='true'\nmachine={m}\n"))
+                .unwrap();
+            assert!(matches!(c.find("x"), Some(Slot::Invalid(_))), "machine = {m}");
+        }
     }
 }

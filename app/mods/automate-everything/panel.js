@@ -8,6 +8,15 @@ import * as cli from "./cli.js";
 import { ago, clock, duration, tone, word, when } from "./format.js";
 
 const REFRESH_MS = 15000;
+// Another machine's own scheduler: asked less often, and never waited on by
+// this Mac's refresh. Which machines run automate-everything: rarer still.
+const REMOTE_MS = 60000;
+const DISCOVER_MS = 5 * 60 * 1000;
+// While a machine has something running: there are no files here to watch for
+// its end, so it's asked this often until nothing is.
+const RUNNING_MS = 5000;
+// After an action on another machine: long enough for a run to have its record.
+const SETTLE_MS = 3000;
 const INSTALL_MS = 5 * 60 * 1000;
 const MOD_DIR = `${appHome()}/mods/automate-everything`;
 const OUTPUT_LINES = 400;
@@ -31,23 +40,36 @@ export class Panel {
     this.drag = null; // a row being dragged to a new place
     this.heights = new Map(); // row heights by name, for working out where a drag lands
     this.noClickUntil = 0;
+    // Machines running automate-everything, by name: { items, runs, status,
+    // error, at (last answer), reachable, version, outdated }.
+    this.remotes = new Map();
+    this.discovered = false; // whether this.remotes has been filled once
+    this.source = null; // how this Mac names itself to the machines it sends copies to
     // Self-install: download (or build) the binary, put it in ~/.local/bin,
-    // keep the launchd agent running. Cheap when nothing changed.
+    // keep the background service (launchd/systemd) running. Cheap when nothing changed.
     this.selfInstall(cx);
     cx.timer.every(INSTALL_MS, (cx) => this.selfInstall(cx));
     this.refresh(cx);
     cx.timer.every(REFRESH_MS, (cx) => this.refresh(cx));
-    // keys.json: "automate-everything.history", ".home", ".new", ".edit:<name>", ".menu:<name>".
+    this.discover(cx);
+    cx.timer.every(DISCOVER_MS, (cx) => this.discover(cx));
+    cx.timer.every(REMOTE_MS, (cx) => this.refreshRemotes(cx));
+    // keys.json: "automate-everything.history", ".home", ".new", ".edit:<name>", ".menu:<name>",
+    // ".run:<id>" (each with "@<machine>" for a machine's own automation), ".refresh[:<machine>]".
     cx.spawn(async (cx) => {
       for (;;) {
         const c = await nextCommand();
-        const [name, arg] = c.split(":");
-        if (name === "history" || name === "home") this.go(name, cx, { filter: arg ?? null });
+        // `<name>@<machine>` for an entry another machine schedules ("@" is never in a name).
+        const [name, rest] = c.split(":");
+        const [arg, on = null] = (rest ?? "").split("@");
+        if (name === "history" || name === "home") this.go(name, cx, { filter: arg || null });
         else if (name === "new") openOverlay(editSpec(null));
-        else if (name === "edit" && arg) openOverlay(editSpec(arg));
-        else if (name === "run" && arg) this.openRun(arg, cx);
+        else if (name === "edit" && arg) openOverlay(editSpec(arg, on));
+        else if (name === "run" && arg) this.openRun(arg, cx, on);
+        // From the popups and the form after a change: `refresh:<machine>`, or this Mac's list.
+        else if (name === "refresh") arg ? this.refreshRemote(arg, cx) : this.refresh(cx);
         else if (name === "menu" && arg) {
-          const item = this.items?.find((i) => i.name === arg);
+          const item = this.allItems().find((i) => i.name === arg && (i.on ?? null) === on);
           if (item) openOverlay(menuSpec(item));
         }
       }
@@ -95,8 +117,9 @@ export class Panel {
           const [items, st] = await Promise.all([cli.list(), cli.status()]);
           this.items = items;
           this.scheduler = st;
+          this.source = st.source_id ?? null;
           if (this.page !== "home") this.runs = await cli.history();
-          if (this.page === "run" && this.detail) this.detail = await cli.show(this.detail.id);
+          if (this.page === "run" && this.detail && !this.detail.on) this.detail = await cli.show(this.detail.id);
           this.error = null;
         } while (this.again);
       } catch (e) {
@@ -107,16 +130,141 @@ export class Panel {
     });
   }
 
+  // ---- other machines ---------------------------------------------------
+  // An automation defined here can run on machines running automate-everything
+  // (`runs_on`): each gets a copy and fires it itself. The panel shows one
+  // line per automation defined here, with its copies' state folded in, plus
+  // the automations a machine has in its own config ("defined on lab").
+
+  // Which machines run automate-everything (the CLI remembers ones seen
+  // before, so an offline one still shows, as unreachable).
+  discover(cx) {
+    cx.spawn(async (cx) => {
+      let ms;
+      try {
+        ms = await cli.machines(true);
+      } catch {
+        this.discovered = true;
+        return; // no hc: this Mac only
+      }
+      this.discovered = true;
+      const found = new Set();
+      for (const m of ms) {
+        const ae = m.automate_everything;
+        if (!ae?.installed) continue;
+        found.add(m.name);
+        const r = this.remotes.get(m.name) ?? { items: null, runs: null, error: null, at: null };
+        r.version = ae.version;
+        r.outdated = (ae.protocol ?? 0) < cli.PROTOCOL;
+        r.seenAt = ae.seen_at;
+        if (ae.reachable === false) {
+          r.reachable = false;
+          r.error ??= `${m.state ?? "unreachable"}`;
+        }
+        const fresh = !this.remotes.has(m.name);
+        this.remotes.set(m.name, r);
+        if (fresh) this.refreshRemote(m.name, cx);
+      }
+      for (const name of [...this.remotes.keys()]) if (!found.has(name)) this.remotes.delete(name);
+      cx.notify();
+    });
+  }
+
+  refreshRemotes(cx) {
+    for (const name of this.remotes.keys()) this.refreshRemote(name, cx);
+  }
+
+  // One machine's list (and history off the home page). Its last answer
+  // stays on screen while this runs or when it fails.
+  refreshRemote(name, cx) {
+    const r = this.remotes.get(name);
+    if (!r || r.outdated) return;
+    if (r.busy) {
+      r.again = true;
+      return;
+    }
+    r.busy = true;
+    cx.spawn(async (cx) => {
+      do {
+        r.again = false;
+        try {
+          const [items, status] = await Promise.all([cli.list(name), cli.status(name)]);
+          r.items = items.map((i) => ({ ...i, on: name }));
+          r.status = status;
+          if (this.page !== "home") r.runs = (await cli.history(200, name)).map((x) => ({ ...x, on: name }));
+          if (this.page === "run" && this.detail?.on === name) this.detail = { ...(await cli.show(this.detail.id, name)), on: name };
+          r.error = null;
+          r.reachable = true;
+          r.at = new Date().toISOString();
+        } catch (e) {
+          r.error = String(e?.message ?? e);
+          r.reachable = false;
+        }
+      } while (r.again);
+      r.busy = false;
+      // Something running there: look again soon, so its end shows when it happens.
+      if (!r.soon && r.items?.some((i) => i.status === "running")) {
+        r.soon = true;
+        cx.timer.after(RUNNING_MS, (cx) => {
+          r.soon = false;
+          this.refreshRemote(name, cx);
+        });
+      }
+      cx.notify();
+    });
+  }
+
+  // Every line on screen: this Mac's automations, then those another machine
+  // defines itself (not the copies this Mac sent it).
+  allItems() {
+    return [...(this.items ?? []), ...this.foreign()];
+  }
+
+  foreign() {
+    return [...this.remotes.values()].flatMap((r) => (r.items ?? []).filter((i) => !this.isCopy(i)));
+  }
+
+  isCopy(i) {
+    return Boolean(i.origin && i.origin === this.source);
+  }
+
+  // Where an automation defined here runs, each with its state there:
+  // { place: "local" | machine, item (that place's list entry), problem }.
+  placesOf(item) {
+    return (item.runs_on ?? ["local"]).map((place) => {
+      if (place === "local") return { place, item };
+      const r = this.remotes.get(place);
+      const copy = r?.items?.find((i) => i.name === item.name && this.isCopy(i));
+      const problem = !this.discovered ? null : !r
+        ? `${place} doesn't run automate-everything, so it can't run this`
+        : r.outdated
+          ? `automate-everything on ${place} is too old to run this: update it there`
+          : r.reachable === false
+            ? `${place} is unreachable: it runs this from the last copy it got`
+            : r.items && !copy ? `Not on ${place} yet: it's sent within a minute`
+              : copy?.error ? `Can't run on ${place}: ${copy.error}` : null;
+      return { place, item: copy ?? null, problem };
+    });
+  }
+
+  // This Mac's runs and every machine's, newest first.
+  allRuns() {
+    if (this.runs === null) return null;
+    const runs = [...this.runs, ...[...this.remotes.values()].flatMap((r) => r.runs ?? [])];
+    return runs.sort((a, b) => Date.parse(when(b)) - Date.parse(when(a)));
+  }
+
   go(page, cx, extra = {}) {
     Object.assign(this, { page, ...extra });
     cx.notify();
     this.refresh(cx);
+    if (page !== "home") this.refreshRemotes(cx);
   }
 
-  openRun(id, cx) {
+  openRun(id, cx, on = null) {
     cx.spawn(async (cx) => {
       try {
-        this.detail = await cli.show(id);
+        this.detail = { ...(await cli.show(id, on)), on };
         this.page = "run";
       } catch (e) {
         this.error = String(e?.message ?? e);
@@ -136,9 +284,10 @@ export class Panel {
   header(t, cx) {
     const back = (to) => this.iconButton(t, "ae-back", `${CHROME}/chevron-left.svg`, (_e, cx) => this.go(to, cx));
     const bar = h_flex().h(42).flex_none().px(10).gap(6).items_center().border_b(1).border_color(t.border);
-    const refresh = this.iconButton(t, "ae-refresh", `${ICON}/refresh.svg`, (_e, cx) => this.refresh(cx), { spin: this.busy, size: 13 });
+    const spin = this.busy || [...this.remotes.values()].some((r) => r.busy);
+    const refresh = this.iconButton(t, "ae-refresh", `${ICON}/refresh.svg`, (_e, cx) => { this.refresh(cx); this.refreshRemotes(cx); }, { spin, size: 13 });
     if (this.page === "home") {
-      const items = this.items ?? [];
+      const items = this.allItems();
       const running = items.filter((i) => i.status === "running").length;
       return bar.pl(14)
         .child(div().font_semibold().text_color(t.foreground).child("Automations"))
@@ -235,64 +384,122 @@ export class Panel {
   }
 
   // Run, pause or resume one automation; the list follows the files changing.
-  act(name, fn, cx) {
+  // On another machine's entry (`on`), that machine is asked again right
+  // away and once more a few seconds later, when a run has its record.
+  act(name, fn, cx, on = null, also = []) {
+    const key = on ? `${name}@${on}` : name;
     this.acting ??= new Set();
-    if (this.acting.has(name)) return;
-    this.acting.add(name);
+    if (this.acting.has(key)) return;
+    this.acting.add(key);
     this.actionError = null;
     cx.spawn(async (cx) => {
       try {
         await fn();
       } catch (e) {
-        this.actionError = `${name}: ${String(e?.message ?? e)}`;
+        this.actionError = `${on ? `${name} on ${on}` : name}: ${String(e?.message ?? e)}`;
       }
-      this.acting.delete(name);
-      this.refresh(cx);
+      this.acting.delete(key);
+      if (!on) this.refresh(cx);
+      // The machines it runs on (or the one that defines it): now, and again
+      // once a run there has its record (or a copy has gone out).
+      for (const m of new Set([on, ...also].filter(Boolean))) {
+        this.refreshRemote(m, cx);
+        cx.timer.after(SETTLE_MS, (cx) => this.refreshRemote(m, cx));
+      }
     });
   }
 
   itemRow(t, item) {
-    const status = this.statusOf(item);
-    const last = item.last;
-    const lastText = last ? `${word(last.status)} ${ago(when(last))}` : "never ran";
+    const on = item.on ?? null;
+    // Another machine's entry while it can't be reached: shown as last known, inert.
+    const offline = Boolean(on && this.remotes.get(on)?.reachable === false);
+    const key = on ? `${item.name}@${on}` : item.name;
+    // Defined here: its state wherever it runs, folded into one line.
+    const places = on ? [] : this.placesOf(item);
+    const machines = places.map((p) => p.place).filter((p) => p !== "local");
+    const states = [item, ...places.filter((p) => p.place !== "local").map((p) => p.item).filter(Boolean)];
+    const running = states.some((i) => i.status === "running");
+    const status = running ? "running" : this.statusOf(item);
+    // The newest last run, wherever it was.
+    const lasts = states.map((i) => i.last && { ...i.last, at: i.on }).filter(Boolean);
+    const last = lasts.sort((a, b) => Date.parse(when(b)) - Date.parse(when(a)))[0];
+    const lastText = last ? `${word(last.status)} ${ago(when(last))}${last.at && machines.length ? ` on ${last.at}` : ""}` : "never ran";
     const next = item.next && status !== "paused" ? `next ${clock(item.next)}` : "";
-    const dragged = Boolean(this.drag?.moved && this.drag.name === item.name);
-    return v_flex().id(`ae-item-${item.name}`).pl(6).pr(16).py(8).gap(3).flex_none()
+    const dragged = Boolean(!on && this.drag?.moved && this.drag.name === item.name);
+    const label = (p) => (p === "local" ? "This Mac" : p);
+    const where = on
+      ? ` · defined on ${on}`
+      : item.machine ? ` on ${item.machine}` : machines.length ? ` · ${places.map((p) => label(p.place)).join(" + ")}` : "";
+    const problems = places.map((p) => p.problem).filter(Boolean);
+    const others = item.status === "invalid" ? [] : (this.twins().get(item.name) ?? []).filter((w) => w !== (on ?? "this Mac"));
+    return v_flex().id(`ae-item-${key}`).pl(6).pr(16).py(8).gap(3).flex_none()
+      .when(offline, (el) => el.opacity(0.55))
       // Mid-drag the list's grabbing cursor shows over every line.
       .when(!this.drag?.moved, (el) => el.cursor_pointer())
       .border_b(1).border_color(t.border)
       .when(dragged, (el) => el.bg(t.selected))
       .when(!this.drag?.moved, (el) => el.hover((s) => s.bg(t.hover)))
-      .on_size_change((size) => this.heights.set(item.name, size.height))
+      .when(!on, (el) => el.on_size_change((size) => this.heights.set(item.name, size.height)))
       .on_click((_e, cx) => {
         if (this.drag?.moved || Date.now() < this.noClickUntil) return;
         this.go("history", cx, { filter: item.name });
       })
       .child(h_flex().gap(8).items_center()
-        .child(h_flex().gap(4).flex_none().items_center().child(this.grip(t, item.name, dragged)).child(this.mark(t, status)))
+        // Reordering is within this Mac's list; another machine's lines get a blank handle.
+        .child(h_flex().gap(4).flex_none().items_center()
+          .child(on ? div().w(12).flex_none() : this.grip(t, item.name, dragged)).child(this.mark(t, status)))
         .child(div().flex_1().min_w(0).truncate().text_size(12.8).text_color(t.foreground).child(item.name))
         .child(div().flex_none().text_size(11.5).text_color(t.dim).child(next))
         .children(status === "invalid" ? [] : [
-          this.rowButton(t, `ae-run-now-${item.name}`, "play.svg", 11,
-            status === "running" ? "Running" : "Run now",
-            status === "running" ? null : (cx) => this.act(item.name, () => cli.runNow(item.name), cx)),
-          this.rowButton(t, `ae-pause-${item.name}`, "pause.svg", 11,
+          this.rowButton(t, `ae-run-now-${key}`, "play.svg", 11,
+            status === "running" ? "Running" : on ? `Run now on ${on}` : places.length > 1 ? `Run now on ${places.map((p) => label(p.place)).join(" and ")}` : machines.length ? `Run now on ${machines[0]}` : "Run now",
+            status === "running" || offline ? null : (cx) => this.act(item.name, () => cli.runNow(item.name, on), cx, on, machines)),
+          this.rowButton(t, `ae-pause-${key}`, "pause.svg", 11,
             item.paused ? "Paused: click to resume" : "Pause",
-            (cx) => this.act(item.name, () => (item.paused ? cli.resume : cli.pause)(item.name), cx),
+            offline ? null : (cx) => this.act(item.name, () => (item.paused ? cli.resume : cli.pause)(item.name, on), cx, on, machines),
             { on: item.paused }),
         ])
-        .child(this.rowButton(t, `ae-more-${item.name}`, "dots.svg", 14, "Edit or delete",
-          () => openOverlay(menuSpec(item)))))
+        .child(this.rowButton(t, `ae-more-${key}`, "dots.svg", 14, "Edit or delete",
+          offline ? null : () => openOverlay(menuSpec(item)))))
       .child(h_flex().pl(36).gap(6).items_center().text_size(11.5)
         .child(div().flex_none().text_color(tone(t, status)).child(status))
-        .child(div().flex_none().text_color(t.dim).child(`· ${item.kind ?? "?"} ·`))
+        .child(div().flex_none().text_color(t.dim).child(`· ${item.kind ?? "?"}${where} ·`))
         .child(div().flex_1().min_w(0).truncate().text_color(last ? tone(t, last.status) : t.dim).child(lastText)))
-      .when(Boolean(item.error), (el) => el.child(div().pl(36).text_size(11.5).text_color(t.blocked).child(item.error)));
+      .when(Boolean(item.error), (el) => el.child(div().pl(36).text_size(11.5).text_color(t.blocked).child(item.error)))
+      .children(problems.map((p) => div().pl(36).text_size(11.5).text_color(t.blocked).child(p)))
+      .when(others.length > 0, (el) => el.child(div().pl(36).text_size(11.5).text_color(t.blocked)
+        .child(on
+          ? `Also defined on this Mac: both fire. Delete the one you don't want.`
+          : `Also defined on ${others.join(", ")}: both fire. Delete the one you don't want.`)));
+  }
+
+  // A line about a machine whose entries are in the list, only when
+  // something's wrong with it: they're shown as last known meanwhile.
+  remoteNotices(t) {
+    const out = [];
+    for (const [name, r] of this.remotes) {
+      const note = r.outdated
+        ? `${name}: automate-everything ${r.version ?? "?"} there is too old to manage from here; update it`
+        : r.reachable === false
+          ? `${name} is unreachable${r.at || r.seenAt ? ` (last seen ${ago(r.at ?? r.seenAt)})` : ""}: its automations show as last known`
+          : r.status && !r.status.scheduler_running ? `${name}'s scheduler isn't running` : null;
+      if (note) out.push(div().id(`ae-remote-${name}`).px(14).py(7).flex_none().text_size(11.5).text_color(t.blocked)
+        .border_b(1).border_color(t.border).tooltip(r.error ?? "").child(note));
+    }
+    return out;
+  }
+
+  // Names in more than one scheduler's config: each one fires.
+  twins() {
+    const seen = new Map();
+    // An invalid entry never fires, so it doesn't count.
+    for (const i of this.allItems().filter((i) => i.status !== "invalid")) seen.set(i.name, [...(seen.get(i.name) ?? []), i.on ?? "this Mac"]);
+    return seen;
   }
 
   home(t) {
     if (this.items === null) return div().px(14).py(10).text_size(12).text_color(t.dim).child(this.error ? "" : "Loading…");
-    if (!this.items.length) {
+    if (!this.items.length && !this.remotes.size) {
       return v_flex().px(16).py(14).gap(6).text_size(12).text_color(t.dim)
         .child("No automations yet.")
         .child("Add one with + or in ~/.config/automate-everything/automations.toml.");
@@ -308,7 +515,10 @@ export class Panel {
           cx.notify();
         }
       })
-      .children(this.ordered().map((i) => this.itemRow(t, i)));
+      // One list: the automations defined here (reorderable), then those a machine defines itself.
+      .children(this.remoteNotices(t))
+      .children(this.ordered().map((i) => this.itemRow(t, i)))
+      .children(this.foreign().map((i) => this.itemRow(t, i)));
   }
 
   // ---- dragging to reorder ---------------------------------------------
@@ -373,14 +583,14 @@ export class Panel {
   // ---- history ----------------------------------------------------------
 
   runRow(t, r) {
-    const bits = [r.trigger, r.kind];
+    const bits = [r.trigger, r.kind, r.machine ? `on ${r.machine}` : r.on && `on ${r.on}`];
     if (r.duration_ms != null) bits.push(duration(r.duration_ms));
     if (r.missed_fires > 1) bits.push(`${r.missed_fires} fires`);
     if (r.caught_up) bits.push(`caught up ${r.caught_up}`);
-    return v_flex().id(`ae-run-${r.id}`).px(16).py(7).gap(2).flex_none().cursor_pointer()
+    return v_flex().id(`ae-run-${r.id}${r.on ? `@${r.on}` : ""}`).px(16).py(7).gap(2).flex_none().cursor_pointer()
       .border_b(1).border_color(t.border)
       .hover((s) => s.bg(t.hover))
-      .on_click((_e, cx) => this.openRun(r.id, cx))
+      .on_click((_e, cx) => this.openRun(r.id, cx, r.on ?? null))
       .child(h_flex().gap(8).items_center()
         .child(this.mark(t, r.status === "running" ? "running" : r.status === "blocked" ? "blocked" : r.status))
         .child(div().flex_1().min_w(0).truncate().text_size(12.8).text_color(t.foreground).child(r.automation))
@@ -391,8 +601,9 @@ export class Panel {
   }
 
   history(t) {
-    if (this.runs === null) return div().px(14).py(10).text_size(12).text_color(t.dim).child("Loading…");
-    const runs = this.filter ? this.runs.filter((r) => r.automation === this.filter) : this.runs;
+    const all = this.allRuns();
+    if (all === null) return div().px(14).py(10).text_size(12).text_color(t.dim).child("Loading…");
+    const runs = this.filter ? all.filter((r) => r.automation === this.filter) : all;
     if (!runs.length) return div().px(16).py(14).text_size(12).text_color(t.dim).child("Nothing has fired yet.");
     return v_flex().id("ae-runs").flex_1().min_h(0).overflow_y_scrollbar().children(runs.map((r) => this.runRow(t, r)));
   }
@@ -429,6 +640,7 @@ export class Panel {
       .child(v_flex().gap(5).children([
         this.field(t, "Status", word(r.status), tone(t, r.status)),
         this.field(t, "Trigger", r.trigger),
+        this.field(t, "Machine", r.machine ?? r.on),
         this.field(t, "Scheduled", r.scheduled_for && new Date(r.scheduled_for).toLocaleString()),
         this.field(t, "Missed", r.missed_fires && `${r.missed_fires} fire(s), from ${new Date(r.first_missed).toLocaleString()}`),
         this.field(t, "Caught up", r.caught_up && `${r.caught_up} earlier fire(s)`),
@@ -474,10 +686,11 @@ export class Panel {
 
 function menuSpec(item) {
   return { frame: "none", mod: "automate-everything", kind: "popup", width: 180,
-    props: { view: "menu", name: item.name } };
+    props: { view: "menu", name: item.name, on: item.on ?? null } };
 }
 
-export function editSpec(name) {
+// `on`: the machine whose scheduler holds the entry; null for this Mac.
+export function editSpec(name, on = null) {
   return { frame: "none", mod: "automate-everything", kind: "dialog", width: 640, height: 0.86,
-    props: { view: "edit", name } };
+    props: { view: "edit", name, on } };
 }

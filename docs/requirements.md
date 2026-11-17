@@ -29,7 +29,7 @@ Terminology:
 9. **Cron schedules**, including weekday-only and hour ranges such as `30 8-15 * * 1-5`.
 10. **A timezone per automation**, defaulting to the system zone. DST-correct: a fixed-time cron fires once on the night the clocks go back, and is not lost on the night they go forward.
 11. **Catch-up with a grace window.** The laptop sleeps. A 7:30 fire missed until 8:10 should still run; a two-minute job missed by an hour should not. Per-automation `grace_minutes`. A fire older than its grace window is recorded as `missed`, and a run of missed fires catches up once, not once per fire.
-12. **Fires without the app window open.** The scheduler must survive the app being closed (a launchd job on macOS).
+12. **Fires without the app window open.** The scheduler must survive the app being closed (a launchd job on macOS, a systemd user service on Linux; on Linux that needs lingering, `loginctl enable-linger`, to keep running after logout, and `status` warns when it's off).
 13. **Timeouts**, separately for the precheck and for the run.
 14. **No overlapping runs of one automation**, whoever started them. A fire that comes due while the same automation is still running, including a manual run, is recorded as `skipped_overlap`, not queued. A blocked run counts as still running until the user finishes it or closes its space. Different automations may run at once.
 15. **One scheduler.** A lock held by the kernel (not a pidfile) keeps a second scheduler from double-firing. The scheduler survives `herdr plugin update` and restarts on the new binary. One invalid entry (a bad cron, a missing script) is reported and skipped; the others keep running.
@@ -43,7 +43,7 @@ Terminology:
       - **a specific space**, named in the entry. The run opens a tab in it, named after the automation. If that space is not open, the run creates it with that name; the plugin then owns it, so a successful run closes it (behaviour 2). Naming the space after the automation gives one shared space that collects that automation's runs as tabs.
 
     Scripts have no space (behaviour 1), so these choices apply to agent runs only.
-17. **Environment.** Scripts, prechecks and agents start with the user's login `PATH`, not launchd's bare one. Per-automation `env`. Every run gets `HERDR_AUTOMATION` (the name) and `HERDR_AUTOMATION_RUN_ID`, so a script can tell it was scheduled.
+17. **Environment.** Scripts, prechecks and agents start with the user's login `PATH`, not the service manager's bare one. When `$SHELL` is unset (launchd and systemd may not set it) the login shell comes from the passwd database, else `/bin/sh`. Per-automation `env`. Every run gets `HERDR_AUTOMATION` (the name) and `HERDR_AUTOMATION_RUN_ID`, so a script can tell it was scheduled.
 18. **Manual run** from the panel or the CLI, including on a paused entry. A manual run skips the precheck (as in Orca) and follows the same close and cleanup rules as a scheduled one.
 19. **Pause and resume** without deleting the entry, from the panel and the CLI.
 
@@ -63,10 +63,31 @@ The panel follows Orca's automations interface: a home page and a history page.
 26. Works with the **desktop app's hc backend**. The TUI backend is not a goal.
 27. **One config file** for scripts and agents. Splitting them (gates.json for scripts, automations.yaml for agents) hides the scripts from the panel. The panel and the CLI both write to it, so its format must survive a program rewriting one entry.
 28. **No stale spaces or worktrees as a side effect.** The original problem.
+29. **macOS and Linux.** The scheduler, scripts and the CLI run on both: a launchd agent on macOS, a systemd user service (`~/.config/systemd/user/com.lucasprag.automate-everything.service`) on Linux, with the same commands (`service install|ensure|uninstall|restart`, `status`). Releases ship a universal macOS binary and static (musl) Linux binaries for x86_64 and aarch64. Agent runs on Linux need `hc` and the agent on the login shell's PATH and are not yet verified there.
+
+## Runs on another machine
+
+29. **A per-automation `machine`**, one of herdr-core's machines (`hc machine ls`). Unset means this Mac, as before. Scheduling, the overlap guard and history stay on this Mac; only the run executes on the machine (unless the machine schedules it, below).
+30. **Paths and environment are the machine's.** `command`, `cwd`, `repo`, `precheck`, `prompt_file` and worktrees resolve there, `~` being its home. Runs get the machine's own login environment plus the entry's `env`; this Mac's is never sent.
+31. **Scripts on a machine behave like local ones:** output and exit code in the run's record, and a timeout stops the script and everything it started on the machine.
+32. **Agent runs on a machine** open their space on it, and their worktrees, cleanup and stopping happen there.
+33. **An unreachable machine fails the run** with a note saying so. No retries; the next fire tries again.
+34. **The machine is checked and shown.** `check` and `set` refuse a machine hc doesn't know and warn when it's only offline. The machine shows in `list`, `show`, history and the panel.
+
+## Runs on other machines, defined here
+
+35. **Defined once, here.** An automation's `runs_on` lists where it runs: `local` and/or machines running automate-everything. No duplicates to keep in step: the definition lives in this machine's config only.
+36. **Each machine fires its own copy** with its own scheduler, so it doesn't depend on this Mac being awake. This Mac sends each machine the whole set of automations meant for it (`_sync-in`), replacing the last in one write; the machine loads them next to its own config and can't change them. Paths, environment, runs and history are the machine's.
+37. **Copies follow changes**: right after a change from the CLI or the panel, and the scheduler checks every minute (and resends every half hour). An offline machine keeps its last copy and gets the new one when it's back. Dropping a machine from `runs_on` removes its copy. An empty timezone is written in as this Mac's.
+38. **Never hangs.** `--on <machine>` runs any CLI command there (`hc exec`); a machine hc doesn't show as connected fails at once, and calls time out (10 s for reads, 30 s for changes). `machines --probe` says which machines run automate-everything and with which version, remembering ones seen before so an offline one still shows.
+39. **One line per automation in the panel**, with where it runs and its last run wherever it was; Run now runs it everywhere. A machine that can't be reached, or hasn't got the latest copy, is said so on the line. Automations a machine defines itself show after, marked, and a name defined in both places is flagged.
+40. **Checked where it runs.** `check` asks each machine in a `runs_on` how it sees its copies and reports the ones it can't run; the panel shows the error on the automation's line.
+41. **Versions.** Copies need protocol 2 on the machine (`status --json` reports `version`, `protocol`, `timezone` and `source_id`); an older one is shown as needing an update. A field it doesn't know makes its copy invalid there, with the error.
+42. **Unchanged when nothing runs elsewhere:** no `runs_on`, no copies, no hc calls; the same panel as before.
 
 ## Out of scope
 
-- Remote machines and hosts (Orca has them).
+- Defining an automation on a machine and editing it from another (a machine's own automations are changed there, with `--on`).
 - RRULE schedules and presets; cron only.
 - Token and cost tracking per run (Orca shows it).
 - Herdr TUI `workflow:` and `session:`.

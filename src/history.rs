@@ -121,6 +121,9 @@ pub struct Run {
     pub caught_up: Option<u32>,
     pub precheck: Option<StepResult>,
     pub runner_pid: Option<u32>,
+    /// The hc machine it ran on; None for this Mac.
+    #[serde(default)]
+    pub machine: Option<String>,
     pub agent: Option<AgentInfo>,
 }
 
@@ -146,6 +149,7 @@ impl Run {
             caught_up: None,
             precheck: None,
             runner_pid: None,
+            machine: None,
             agent: None,
         }
     }

@@ -71,17 +71,33 @@ pub fn live_with_labels(labels: &[(&str, &str)]) -> Result<Vec<Value>> {
 }
 
 pub struct Launch<'a> {
+    /// Another machine; None for this one.
+    pub on: Option<&'a str>,
     pub cwd: &'a str,
     pub labels: Vec<(String, String)>,
     pub argv: Vec<String>,
+    /// Replace a lost program with a shell (`--keep`), as for an agent.
+    pub keep: bool,
+    /// Remove the terminal once its program ends (`--rm`).
+    pub rm: bool,
 }
 
-/// Starts a kept terminal that belongs to no one, so it outlives us.
+/// Starts a terminal that belongs to no one, so it outlives us.
 pub fn launch(l: &Launch) -> Result<String> {
-    let mut args: Vec<String> = ["run", "--bg", "--json", "--keep", "--no-parent", "--outlive-parent", "--no-notify"]
+    let mut args: Vec<String> = ["run", "--bg", "--json", "--no-parent", "--outlive-parent", "--no-notify"]
         .iter()
         .map(|s| s.to_string())
         .collect();
+    if l.keep {
+        args.push("--keep".into());
+    }
+    if l.rm {
+        args.push("--rm".into());
+    }
+    if let Some(m) = l.on {
+        args.push("--on".into());
+        args.push(m.into());
+    }
     args.push("--cwd".into());
     args.push(l.cwd.into());
     for (k, v) in &l.labels {
@@ -132,6 +148,118 @@ pub fn kill(addr: &str) -> Result<()> {
     Ok(())
 }
 
+/// `lab/t7` → `t7`: the address as the terminal's own machine knows it.
+pub fn local_address(addr: &str) -> &str {
+    addr.rsplit_once('/').map(|(_, t)| t).unwrap_or(addr)
+}
+
+/// Removes a finished terminal.
+pub fn rm(addr: &str) -> Result<()> {
+    let (code, _, err) = run_json(&["rm", addr, "--json"], Duration::from_secs(30))?;
+    if code != Some(0) {
+        bail!("hc rm {addr}: {}", err.trim());
+    }
+    Ok(())
+}
+
+/// The machines added to hc (`hc machine ls`): each with `name` and `state`.
+pub fn machines() -> Result<Vec<Value>> {
+    let (code, v, err) = run_json(&["machine", "ls", "--json"], Duration::from_secs(20))?;
+    if code != Some(0) {
+        bail!("hc machine ls: {}", err.trim());
+    }
+    Ok(v["machines"].as_array().cloned().unwrap_or_default())
+}
+
+pub struct ExecOut {
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    /// hc cut the output at its limit.
+    pub truncated: bool,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl ExecOut {
+    pub fn ok(&self) -> bool {
+        self.exit_code == Some(0) && !self.timed_out
+    }
+    pub fn stdout_text(&self) -> String {
+        String::from_utf8_lossy(&self.stdout).to_string()
+    }
+    pub fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(&self.stderr).trim().to_string()
+    }
+}
+
+/// `hc exec --on <machine>`: runs argv there (no shell) with a timeout of at
+/// most 600 s, for short helpers. Errs when hc couldn't run it at all (an
+/// unknown or unreachable machine); the program's own failure is in the result.
+pub fn exec_on(machine: &str, argv: &[&str], timeout_secs: u64) -> Result<ExecOut> {
+    exec_on_within(machine, argv, timeout_secs, Duration::from_secs(60))
+}
+
+/// `exec_on`, giving up on hc itself `grace` after the program's own timeout
+/// (a machine that stops answering mid-call).
+pub fn exec_on_within(machine: &str, argv: &[&str], timeout_secs: u64, grace: Duration) -> Result<ExecOut> {
+    let t = timeout_secs.clamp(1, 600).to_string();
+    let mut args = vec!["exec", "--json", "--on", machine, "--timeout", &t, "--"];
+    args.extend_from_slice(argv);
+    let (code, v, err) = run_json(&args, Duration::from_secs(timeout_secs.min(600)) + grace)?;
+    if code != Some(0) || v.is_null() {
+        bail!("{}", error_message(&err).unwrap_or_else(|| format!("hc exec failed (exit {code:?})")));
+    }
+    Ok(ExecOut {
+        exit_code: v["code"].as_i64().map(|c| c as i32),
+        timed_out: v["timed_out"].as_bool().unwrap_or(false),
+        truncated: v["truncated"].as_bool().unwrap_or(false),
+        stdout: base64_decode(v["stdout"].as_str().unwrap_or("")),
+        stderr: base64_decode(v["stderr"].as_str().unwrap_or("")),
+    })
+}
+
+/// hc's error, as it prints it on stderr: `{"error":{"message":..,"hint":..}}`.
+fn error_message(stderr: &str) -> Option<String> {
+    let text = stderr.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(text) else { return Some(text.to_string()) };
+    let e = &v["error"];
+    let msg = e["message"].as_str()?;
+    Some(match e["hint"].as_str() {
+        Some(h) if !h.is_empty() => format!("{msg} ({h})"),
+        _ => msg.to_string(),
+    })
+}
+
+/// Base64, as `hc exec --json` prints output (no crate for one decoder);
+/// padding and anything else is skipped.
+fn base64_decode(s: &str) -> Vec<u8> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0);
+    for v in s.bytes().filter_map(val) {
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    out
+}
+
 /// One API call over `hc connect`.
 pub fn rpc(method: &str, params: Value) -> Result<Value> {
     let mut c = command();
@@ -161,26 +289,28 @@ pub fn rpc(method: &str, params: Value) -> Result<Value> {
     bail!("{method}: no answer from hc ({})", String::from_utf8_lossy(&out.stderr).trim())
 }
 
-pub fn doc_get() -> Result<(Value, u64)> {
-    let r = rpc("doc.get", json!({ "name": DOC }))?;
+/// The app's document on this machine (`on` None) or another one: a space
+/// on another machine lives in that machine's own document.
+pub fn doc_get(on: Option<&str>) -> Result<(Value, u64)> {
+    let r = rpc("doc.get", json!({ "name": DOC, "on": on }))?;
     Ok((r["value"].clone(), r["version"].as_u64().unwrap_or(0)))
 }
 
 /// Changes the app's document, retrying when someone else wrote it first.
 /// `f` returns false to leave it unchanged.
-pub fn doc_update<F>(mut f: F) -> Result<()>
+pub fn doc_update<F>(on: Option<&str>, mut f: F) -> Result<()>
 where
     F: FnMut(&mut Value) -> Result<bool>,
 {
     for _ in 0..8 {
-        let (mut doc, version) = doc_get()?;
+        let (mut doc, version) = doc_get(on)?;
         if doc.is_null() {
             doc = json!({ "spaces": [] });
         }
         if !f(&mut doc)? {
             return Ok(());
         }
-        match rpc("doc.set", json!({ "name": DOC, "value": doc, "version": version })) {
+        match rpc("doc.set", json!({ "name": DOC, "on": on, "value": doc, "version": version })) {
             Ok(_) => return Ok(()),
             Err(e) if format!("{e}").contains("conflict") => {
                 std::thread::sleep(Duration::from_millis(300));
@@ -206,9 +336,9 @@ pub fn spaces(doc: &Value) -> Vec<Value> {
     doc["spaces"].as_array().cloned().unwrap_or_default()
 }
 
-/// An open space on this machine with this name.
-pub fn find_space_by_name(name: &str) -> Result<Option<String>> {
-    let (doc, _) = doc_get()?;
+/// An open space with this name, on this machine (`on` None) or another one.
+pub fn find_space_by_name(on: Option<&str>, name: &str) -> Result<Option<String>> {
+    let (doc, _) = doc_get(on)?;
     Ok(spaces(&doc)
         .iter()
         .find(|s| s["name"].as_str() == Some(name) && s.get("machine").map(|m| m.is_null()).unwrap_or(true))
@@ -218,6 +348,7 @@ pub fn find_space_by_name(name: &str) -> Result<Option<String>> {
 /// Names a space and one of its tabs, adding them to the document when the
 /// app hasn't (it isn't running).
 pub fn name_space_and_tab(
+    on: Option<&str>,
     space_id: &str,
     space_name: &str,
     folder: &str,
@@ -225,7 +356,9 @@ pub fn name_space_and_tab(
     tab_name: &str,
     terminal: &str,
 ) -> Result<()> {
-    doc_update(|doc| {
+    // A machine's document names its terminals without the `machine/` prefix.
+    let terminal = local_address(terminal);
+    doc_update(on, |doc| {
         if !doc["spaces"].is_array() {
             doc["spaces"] = json!([]);
         }
@@ -269,9 +402,10 @@ pub fn name_space_and_tab(
 }
 
 /// Names a tab in an existing space, adding it to the document when the app
-/// hasn't yet. Leaves the space's own name alone.
+/// hasn't yet. Leaves the space's own name alone. This machine only: `tab
+/// open` runs where its caller does.
 pub fn name_tab(space_id: &str, tab_id: &str, tab_name: &str, terminal: &str) -> Result<()> {
-    doc_update(|doc| {
+    doc_update(None, |doc| {
         let Some(list) = doc["spaces"].as_array_mut() else { bail!("no space {space_id} in the app's document") };
         let Some(space) = list.iter_mut().find(|s| s["id"] == space_id) else {
             bail!("no space {space_id} in the app's document")
@@ -302,8 +436,8 @@ pub fn name_tab(space_id: &str, tab_id: &str, tab_name: &str, terminal: &str) ->
 
 /// Drops a tab (and its space, when it was the last) from the document,
 /// for when the app isn't running to notice its terminals ended.
-pub fn forget_tab(space_id: &str, tab_id: &str) -> Result<()> {
-    doc_update(|doc| {
+pub fn forget_tab(on: Option<&str>, space_id: &str, tab_id: &str) -> Result<()> {
+    doc_update(on, |doc| {
         let Some(list) = doc["spaces"].as_array_mut() else { return Ok(false) };
         let Some(i) = list.iter().position(|s| s["id"] == space_id) else { return Ok(false) };
         let Some(tabs) = list[i]["tabs"].as_array_mut() else { return Ok(false) };
@@ -317,4 +451,31 @@ pub fn forget_tab(space_id: &str, tab_id: &str) -> Result<()> {
         }
         Ok(true)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_decodes_hc_exec_output() {
+        assert_eq!(base64_decode("aGkK"), b"hi\n");
+        assert_eq!(base64_decode("ZQo="), b"e\n");
+        assert_eq!(base64_decode(""), b"");
+        assert_eq!(base64_decode("TGludXggbGFi"), b"Linux lab");
+    }
+
+    #[test]
+    fn error_message_reads_hcs_json_error() {
+        let err = r#"{"error":{"hint":"machines: lab","kind":"machine_unknown","message":"unknown machine \"x\""}}"#;
+        assert_eq!(error_message(err).unwrap(), "unknown machine \"x\" (machines: lab)");
+        assert_eq!(error_message("plain text\n").unwrap(), "plain text");
+        assert_eq!(error_message("  "), None);
+    }
+
+    #[test]
+    fn local_address_drops_the_machine() {
+        assert_eq!(local_address("lab/t1p"), "t1p");
+        assert_eq!(local_address("t7"), "t7");
+    }
 }

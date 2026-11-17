@@ -1,4 +1,4 @@
-//! The user's login environment. launchd starts us with a bare PATH, so
+//! The user's login environment. launchd and systemd start us with a bare PATH, so
 //! scripts, prechecks and agents get the environment a login shell builds
 //! instead, cached for a few minutes.
 
@@ -15,9 +15,39 @@ const MARKER: &str = "__AUTOMATE_EVERYTHING_ENV__";
 /// Variables a login shell sets that describe that shell, not the user.
 const DROP: &[&str] = &["_", "SHLVL", "PWD", "OLDPWD", "TERM_SESSION_ID", "HC_TERMINAL_ID"];
 
+/// The user's shell: `$SHELL`, else their login shell from the passwd
+/// database (launchd and systemd may start us without `$SHELL`), else
+/// `/bin/sh`.
+pub fn user_shell() -> String {
+    std::env::var("SHELL").ok().filter(|s| !s.is_empty()).or_else(passwd_shell).unwrap_or_else(|| "/bin/sh".into())
+}
+
+/// `SHELL` from a login environment when it's set, else [`user_shell`].
+pub fn shell_of(env: &BTreeMap<String, String>) -> String {
+    env.get("SHELL").cloned().filter(|s| !s.is_empty()).unwrap_or_else(user_shell)
+}
+
+/// A field of this user's passwd entry, None when it's empty or there's no
+/// entry. A static (musl) build reads only /etc/passwd, so directory users
+/// (LDAP, SSSD) aren't found.
+pub fn passwd_field(field: fn(&libc::passwd) -> *const libc::c_char) -> Option<String> {
+    // getpwuid's result lives in static storage: copied out right away.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || field(&*pw).is_null() {
+            return None;
+        }
+        let s = std::ffi::CStr::from_ptr(field(&*pw)).to_str().ok()?.trim().to_string();
+        (!s.is_empty()).then_some(s)
+    }
+}
+
+fn passwd_shell() -> Option<String> {
+    passwd_field(|pw| pw.pw_shell)
+}
+
 fn from_shell() -> Option<BTreeMap<String, String>> {
-    let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/zsh".into());
-    let mut cmd = Command::new(&shell);
+    let mut cmd = Command::new(user_shell());
     cmd.args(["-l", "-i", "-c", &format!("printf '\\0{MARKER}\\0'; /usr/bin/env -0")])
         .current_dir(paths::home())
         .stdin(Stdio::null());

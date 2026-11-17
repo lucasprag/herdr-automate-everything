@@ -1,4 +1,5 @@
-//! The scheduler: one process (a launchd agent), held to one by a kernel lock.
+//! The scheduler: one process (a launchd agent on macOS, a systemd user
+//! service on Linux), held to one by a kernel lock.
 //! Every minute it finds the fires each automation had since it last looked,
 //! starts a run for the newest one if it's inside the grace window, and
 //! records `missed` otherwise. Runs are separate processes, so restarting the
@@ -8,6 +9,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use anyhow::Result;
@@ -44,7 +47,7 @@ fn save_cursors(c: &Cursors) {
 }
 
 fn exe_identity() -> Option<(u64, i64)> {
-    let exe = std::env::current_exe().ok()?;
+    let exe = paths::current_exe().ok()?;
     let m = std::fs::metadata(exe).ok()?;
     Some((m.ino(), m.mtime()))
 }
@@ -89,7 +92,8 @@ fn tick(st: &mut State) {
     for a in cfg.valid() {
         let cursor = *st.cursors.entry(a.name.clone()).or_insert(now);
         st.cursors.insert(a.name.clone(), now);
-        if a.paused() {
+        // Only on other machines (`runs_on`): they fire their own copies.
+        if a.paused() || !a.runs_here() {
             continue;
         }
         let from = cursor.max(now - Duration::days(MAX_LOOKBACK_DAYS));
@@ -144,6 +148,30 @@ fn tick(st: &mut State) {
     save_cursors(&st.cursors);
 }
 
+/// Sends other machines their copies (`sync`) on a thread of its own, so a
+/// slow machine never holds up a fire; one send at a time.
+fn send_copies(sending: &Arc<AtomicBool>) {
+    if sending.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let sending = sending.clone();
+    std::thread::spawn(move || {
+        match crate::sync::send() {
+            Ok(outcomes) => {
+                for o in outcomes {
+                    match o.result {
+                        Some(Ok(n)) => log(&format!("sent `{}` its {n} automations", o.machine)),
+                        Some(Err(e)) => log(&format!("could not send `{}` its automations: {e:#}", o.machine)),
+                        None => {}
+                    }
+                }
+            }
+            Err(e) => log(&format!("could not work out what to send other machines: {e:#}")),
+        }
+        sending.store(false, Ordering::SeqCst);
+    });
+}
+
 fn trim_log() {
     let path = paths::scheduler_log();
     if let Ok(m) = std::fs::metadata(&path) {
@@ -172,8 +200,10 @@ pub fn serve() -> Result<()> {
     let mut st = State { cursors: load_cursors(), reported: HashMap::new(), config_error: None };
     let mut last_prune: Option<DateTime<Utc>> = None;
 
+    let sending = Arc::new(AtomicBool::new(false));
     loop {
         tick(&mut st);
+        send_copies(&sending);
 
         if last_prune.map(|t| Utc::now() - t > Duration::hours(1)).unwrap_or(true) {
             if let Ok(cfg) = config::load() {
@@ -196,11 +226,11 @@ pub fn serve() -> Result<()> {
         // close-on-exec, so the new image takes the lock again.
         if exe_identity() != exe {
             log("binary changed; restarting as the new one");
-            let err = match std::env::current_exe() {
+            let err = match paths::current_exe() {
                 Ok(path) => Command::new(path).args(std::env::args_os().skip(1)).exec(),
                 Err(e) => e,
             };
-            log(&format!("couldn't restart as the new binary ({err}); exiting so launchd starts it"));
+            log(&format!("couldn't restart as the new binary ({err}); exiting so the service manager starts it"));
             return Ok(());
         }
 

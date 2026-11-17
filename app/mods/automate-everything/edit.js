@@ -1,10 +1,17 @@
 // The edit form: one entry's fields. Save sends them to `automate-everything
 // set`, which validates and rewrites only that entry; anything invalid comes
 // back as an error here and nothing is written.
+//
+// "Runs on" picks where: this Mac and/or machines running automate-everything
+// (`runs_on`), each of which gets a copy and fires it itself. A machine
+// without automate-everything can still be picked on its own: this Mac fires
+// the run and it executes there through hc (`machine`).
+// An automation a machine defines itself is edited there (`--on`), without
+// "Runs on".
 
-import { div } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, TextareaState, Textarea } from "gpui-base";
-import { theme, props, closeOverlay, settings } from "herdr";
+import { div, svg } from "gpui-kit";
+import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, Checkbox } from "gpui-base";
+import { theme, props, closeOverlay, settings, run } from "herdr";
 import * as cli from "./cli.js";
 
 // [key, label, placeholder, kind ("all" | "script" | "agent"), type]
@@ -29,6 +36,8 @@ const FIELDS = [
   ["env", "Environment", "KEY=value, one per line (optional)", "all", "env"],
 ];
 
+const CHROME = "mods/workspace-chrome";
+
 const CHOICES = {
   kind: [["script", "Script"], ["agent", "Agent"]],
   directory: [["repo", "The repo"], ["worktree", "New worktree per run"]],
@@ -49,7 +58,13 @@ export class Edit {
     this.error = null;
     this.saving = false;
     this.loaded = this.creating;
-    this.choice = { kind: "script", directory: "repo", space: "per-run" };
+    // A machine's own automation, edited there; null for one defined here.
+    this.from = p.on ?? null;
+    // places: where it runs ("local" and/or machines); via: a machine without
+    // automate-everything this Mac runs it on through hc.
+    this.choice = { kind: "script", directory: "repo", space: "per-run", places: ["local"], via: null };
+    // hc's machines, for the picker; [] until known (or when hc has none).
+    this.machines = [];
     this.handle = cx.focus_handle();
     this.nameInput = InputState.new({ placeholder: "my-automation (letters, digits, - _ .)" });
     this.inputs = {};
@@ -62,19 +77,29 @@ export class Edit {
         this.inputs[key] = InputState.new({ placeholder });
       }
     }
+    cx.spawn(async (cx) => {
+      try {
+        this.machines = await cli.machines(true);
+        this.upgrade();
+      } catch {}
+      cx.notify();
+    });
     if (this.creating) {
       this.nameInput.focus();
       return;
     }
     cx.spawn(async (cx) => {
       try {
-        const entry = await cli.get(p.name);
+        const entry = await cli.get(p.name, this.from);
         this.choice.kind = entry.kind ?? "script";
         this.choice.directory = entry.directory ?? "repo";
         this.choice.space = entry.space ?? "per-run";
+        this.choice.places = entry.runs_on ?? ["local"];
+        this.choice.via = entry.machine ?? null;
         for (const [key] of FIELDS) this.inputs[key].set_value(toText(key, entry[key]));
         // What the form shows now, so Save sends only what changed.
         try { this.original = this.fields(); } catch { this.original = {}; }
+        this.upgrade();
         this.loaded = true;
       } catch (e) {
         this.error = String(e?.message ?? e);
@@ -84,6 +109,14 @@ export class Edit {
   }
 
   close() { closeOverlay(props().overlay); }
+
+  // An entry this Mac runs on a machine (`machine`) that now runs
+  // automate-everything itself: offered as running there, fired by that
+  // machine, so it doesn't depend on this Mac. Saving makes it so.
+  upgrade() {
+    const v = this.choice.via;
+    if (v && this.capable(v)) Object.assign(this.choice, { via: null, places: [v] });
+  }
 
   shown(scope) {
     if (scope === "all") return true;
@@ -95,6 +128,11 @@ export class Edit {
   // so `set` removes what was cleared.
   fields() {
     const out = { kind: this.choice.kind };
+    if (!this.from) {
+      const places = this.choice.places;
+      out.runs_on = places.length === 1 && places[0] === "local" ? null : places;
+      out.machine = this.choice.via ?? null;
+    }
     const agent = this.choice.kind === "agent";
     out.directory = agent && this.choice.directory === "worktree" ? "worktree" : null;
     out.space = agent && this.choice.space === "shared" ? "shared" : null;
@@ -149,7 +187,11 @@ export class Edit {
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        await cli.save(name, fields, this.creating);
+        await cli.save(name, fields, this.creating, this.from);
+        // The panel only hears about this Mac's files; tell it about the
+        // machines that got (or lost) a copy, or the one that defines it.
+        const machines = new Set([this.from, ...this.choice.places, ...(this.original?.runs_on ?? [])]);
+        for (const m of machines) if (m && m !== "local") run(`automate-everything.refresh:${m}`);
         this.close();
       } catch (e) {
         this.error = String(e?.message ?? e);
@@ -159,16 +201,82 @@ export class Edit {
     });
   }
 
-  segmented(t, key) {
-    return h_flex().gap(0).children(CHOICES[key].map(([value, label]) => {
+  segmented(t, key, options = CHOICES[key]) {
+    return h_flex().gap(0).children(options.map(([value, label]) => {
       const on = this.choice[key] === value;
-      return h_flex().id(`seg-${key}-${value}`).h(30).px(12).items_center().cursor_pointer()
+      // "/" can't be in a machine name, so This Mac (null) can't clash with one.
+      return h_flex().id(`seg-${key}-${value ?? "/local"}`).h(30).px(12).items_center().cursor_pointer()
         .border_1().border_color(on ? t.accent : t.input).bg(on ? t.selected : t.background)
         .text_size(12).text_color(on ? t.foreground : t.muted)
         .hover((s) => s.text_color(t.foreground))
         .on_click((_e, cx) => { this.choice[key] = value; cx.notify(); })
         .child(label);
     }));
+  }
+
+  // Whether `machine` runs automate-everything new enough to fire its own copy.
+  capable(machine) {
+    return cli.schedulers(this.machines).some((m) => m.name === machine);
+  }
+
+  // Clicking a place: This Mac and capable machines toggle (at least one
+  // stays on); a machine without automate-everything is on its own (this Mac
+  // runs it there).
+  toggle(place) {
+    const c = this.choice;
+    if (place !== "local" && !this.capable(place)) {
+      Object.assign(c, c.via === place ? { via: null, places: ["local"] } : { via: place, places: ["local"] });
+      return;
+    }
+    if (c.via) {
+      c.via = null;
+      c.places = place === "local" ? ["local"] : ["local", place];
+      return;
+    }
+    const next = c.places.includes(place) ? c.places.filter((p) => p !== place) : [...c.places, place];
+    if (!next.length) return;
+    // This Mac first, then machines in hc's order.
+    const order = ["local", ...this.machines.map((m) => m.name)];
+    c.places = next.sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99));
+  }
+
+  // A checkbox per place: "This Mac", then each hc machine (with its state
+  // when not connected), plus any the entry names that hc doesn't list (any
+  // more). Each place fires it with its own scheduler; only a machine without
+  // automate-everything needs a word, since this Mac drives it.
+  placePicker(t) {
+    const c = this.choice;
+    const names = this.machines.map((m) => m.name);
+    for (const p of [...c.places, c.via]) if (p && p !== "local" && !names.includes(p)) names.push(p);
+    const ticked = (p) => (c.via ? p === c.via || p === "local" : c.places.includes(p));
+    const rows = [["local", "This Mac", null]];
+    for (const n of names) {
+      const m = this.machines.find((x) => x.name === n);
+      const state = !m ? "unknown to hc" : m.state !== "connected" ? m.state : null;
+      const hint = this.capable(n) ? null
+        : `No automate-everything there: this Mac fires it and runs it on ${n} through hc. Can't be combined with another machine.`;
+      rows.push([n, state ? `${n} (${state})` : n, hint]);
+    }
+    const box = (on) => div().size(14).mt(1).flex_none().flex().items_center().justify_center()
+      .border_1().border_color(on ? t.accent : t.input).bg(on ? t.accent : t.background)
+      .when(on, (el) => el.child(svg(`${CHROME}/check.svg`).size(11).text_color(t.solid_foreground)));
+    const list = v_flex().gap(6).children(rows.map(([value, label, hint]) => {
+      const on = ticked(value);
+      // Through hc, This Mac fires it: shown ticked, but not something to untick on its own.
+      const locked = value === "local" && Boolean(c.via);
+      return Checkbox.new(`place-${value}`).checked(on)
+        .on_change((_v, cx) => { if (!locked) { this.toggle(value); cx.notify(); } })
+        .h_flex().gap(8).items_start().cursor_pointer()
+        .when(locked, (el) => el.opacity(0.6))
+        .child(box(on))
+        .child(v_flex().gap(1).min_w(0)
+          .child(div().text_size(12.5).text_color(t.foreground).child(label))
+          .when(Boolean(hint), (el) => el.child(div().text_size(11).text_color(t.dim).child(hint))));
+    }));
+    const elsewhere = c.via || c.places.some((p) => p !== "local");
+    return elsewhere
+      ? v_flex().gap(8).child(list).child(div().text_size(11).text_color(t.dim).child("Paths and ~ are on the machine it runs on."))
+      : list;
   }
 
   row(t, label, control) {
@@ -196,6 +304,8 @@ export class Edit {
     if (this.creating) rows.push(this.row(t, "Name", h_flex().id("f-name").h(34).px(10).items_center().border_1().border_color(t.input).bg(t.background)
       .on_click(() => this.nameInput.focus()).child(Input.new(this.nameInput).flex_1().h_full().text_size(12.5).text_color(t.foreground))));
     rows.push(this.row(t, "Kind", this.segmented(t, "kind")));
+    const elsewhere = this.choice.via || this.choice.places.some((p) => p !== "local");
+    if (!this.from && (this.machines.length || elsewhere)) rows.push(this.row(t, "Runs on", this.placePicker(t)));
     for (const [key, label, , scope] of FIELDS) {
       if (key === "repo" && this.shown("agent")) {
         rows.push(this.row(t, label, this.input(t, key)));
@@ -219,7 +329,7 @@ export class Edit {
         cx.stop_propagation();
       })
       .child(h_flex().px(18).pt(16).pb(10).items_center()
-        .child(div().flex_1().text_size(15).font_semibold().text_color(t.foreground).child(this.creating ? "New automation" : `Edit ${p.name}`))
+        .child(div().flex_1().text_size(15).font_semibold().text_color(t.foreground).child(this.creating ? "New automation" : this.from ? `Edit ${p.name} (defined on ${this.from})` : `Edit ${p.name}`))
         .child(div().text_size(11).text_color(t.dim).child("Cmd+Enter: save · Esc")))
       .child(v_flex().id("ae-edit-fields").flex_1().min_h(0).overflow_y_scrollbar().px(18).pb(12).gap(12)
         .children(this.loaded ? rows : [div().text_color(t.dim).child(this.error ? "" : "Loading…")]))

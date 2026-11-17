@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -8,10 +8,15 @@ pub fn home() -> PathBuf {
 
 /// Expands a leading `~` or `~/`.
 pub fn expand(p: &str) -> PathBuf {
+    expand_in(&home(), p)
+}
+
+/// Expands a leading `~` or `~/` against `home`: another machine's, say.
+pub fn expand_in(home: &Path, p: &str) -> PathBuf {
     if p == "~" {
-        home()
+        home.to_path_buf()
     } else if let Some(rest) = p.strip_prefix("~/") {
-        home().join(rest)
+        home.join(rest)
     } else {
         PathBuf::from(p)
     }
@@ -65,6 +70,30 @@ pub fn login_env_cache() -> PathBuf {
     state_dir().join("login-env.json")
 }
 
+/// Copies of automations other machines sent this one, one file per sender.
+pub fn received_dir() -> PathBuf {
+    state_dir().join("received")
+}
+
+/// What this machine last sent each machine in a `runs_on`.
+pub fn sent_file() -> PathBuf {
+    state_dir().join("sent.json")
+}
+
+pub fn sync_lock() -> PathBuf {
+    state_dir().join("sync.lock")
+}
+
+/// The random tag in this machine's id as a sender.
+pub fn id_file() -> PathBuf {
+    state_dir().join("id")
+}
+
+/// Machines seen running automate-everything (`machines --probe`).
+pub fn machines_cache() -> PathBuf {
+    state_dir().join("machines.json")
+}
+
 pub fn ensure_state_dirs() -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let state = state_dir();
@@ -75,4 +104,30 @@ pub fn ensure_state_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(runs_dir())?;
     std::fs::create_dir_all(locks_dir())?;
     Ok(())
+}
+
+/// This binary's path. On Linux, once the file is swapped for a new one
+/// (`service ensure` renames it into place) `/proc/self/exe` reads
+/// `<path> (deleted)`; the path itself is where the new binary is.
+pub fn current_exe() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    if let Some(p) = exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        return Ok(PathBuf::from(p));
+    }
+    Ok(exe)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_against_another_home() {
+        let home = Path::new("/home/me");
+        assert_eq!(expand_in(home, "~"), PathBuf::from("/home/me"));
+        assert_eq!(expand_in(home, "~/dev/x"), PathBuf::from("/home/me/dev/x"));
+        assert_eq!(expand_in(home, "/srv/x"), PathBuf::from("/srv/x"));
+        assert_eq!(expand_in(home, "~other/x"), PathBuf::from("~other/x"));
+    }
 }

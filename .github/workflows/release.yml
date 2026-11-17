@@ -1,6 +1,8 @@
 # Pushing a tag like v0.2.0 builds the binary for Apple Silicon and Intel,
-# joins them into one universal binary and attaches it to a GitHub release.
-# install.sh downloads it, so nobody needs Rust to use the mod.
+# joins them into one universal binary and attaches it to a GitHub release,
+# together with static (musl) Linux binaries for x86_64 and aarch64.
+# install.sh downloads the one for its machine, so nobody needs Rust to use
+# the mod.
 name: release
 
 on:
@@ -11,7 +13,37 @@ permissions:
   contents: write
 
 jobs:
+  linux:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # Static, so one binary runs on any distro. Nothing links C, so the
+      # musl target needs no musl-tools.
+      - name: Build
+        run: |
+          rustup target add ${{ matrix.arch }}-unknown-linux-musl
+          cargo build --release --locked --target ${{ matrix.arch }}-unknown-linux-musl
+          mkdir dist
+          asset=automate-everything-linux-${{ matrix.arch }}
+          cp .target/${{ matrix.arch }}-unknown-linux-musl/release/automate-everything "dist/$asset"
+          "dist/$asset" --version
+          cd dist && sha256sum "$asset" > "$asset.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+
   release:
+    needs: linux
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
@@ -40,6 +72,12 @@ jobs:
           codesign --force --sign - dist/automate-everything-macos
           dist/automate-everything-macos --version
           cd dist && shasum -a 256 automate-everything-macos > automate-everything-macos.sha256
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          path: dist
+          merge-multiple: true
 
       - name: Publish the release
         env:

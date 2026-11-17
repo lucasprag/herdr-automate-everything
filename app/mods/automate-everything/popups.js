@@ -24,10 +24,11 @@ export class Menu {
     // Run now and pause/resume are buttons on the automation's line.
     const items = [];
     // The panel opens the form: a dialog opened from this popup loses its async load when the popup closes.
-    items.push(item("m-edit", "Edit", () => { closeOverlay(p.overlay); run(`automate-everything.edit:${p.name}`); }));
+    const key = p.on ? `${p.name}@${p.on}` : p.name;
+    items.push(item("m-edit", "Edit", () => { closeOverlay(p.overlay); run(`automate-everything.edit:${key}`); }));
     items.push(item("m-delete", "Delete…", () => {
       closeOverlay(p.overlay);
-      openOverlay({ frame: "none", mod: "automate-everything", kind: "dialog", width: 420, height: 170, props: { view: "confirm", name: p.name } });
+      openOverlay({ frame: "none", mod: "automate-everything", kind: "dialog", width: 420, height: 170, props: { view: "confirm", name: p.name, on: p.on ?? null } });
     }, t.blocked));
     return frame(t).id("ae-menu").track_focus(this.handle).w_full().py(4).children(items);
   }
@@ -46,7 +47,9 @@ export class Confirm {
     this.busy = true;
     cx.spawn(async (cx) => {
       try {
-        await cli.remove(props().name);
+        await cli.remove(props().name, props().on ?? null);
+        // The panel only hears about this Mac's files; tell it about another machine's.
+        if (props().on) run(`automate-everything.refresh:${props().on}`);
         closeOverlay(props().overlay);
       } catch (e) {
         this.error = String(e?.message ?? e);
@@ -71,10 +74,12 @@ export class Confirm {
         cx.stop_propagation();
       })
       .child(h_flex().items_center()
-        .child(div().flex_1().text_size(15).font_semibold().text_color(t.foreground).child(`Delete ${p.name}?`))
+        .child(div().flex_1().text_size(15).font_semibold().text_color(t.foreground).child(p.on ? `Delete ${p.name} on ${p.on}?` : `Delete ${p.name}?`))
         .child(div().text_size(11).text_color(t.dim).child("Esc")))
       .child(div().flex_1().min_h(0).text_color(t.muted)
-        .child(this.error ?? "Removes it from automations.toml and deletes its run history. Its open spaces stay."))
+        .child(this.error ?? (p.on
+          ? `Removes it from ${p.on}'s automations.toml and deletes its run history there. Its open spaces stay.`
+          : "Removes it from automations.toml and deletes its run history. Its open spaces stay.")))
       .child(h_flex().justify_end().gap(8).text_size(12)
         .child(button("no", "Cancel", t.raised, t.foreground, t.input, () => closeOverlay(props().overlay)))
         .child(button("yes", this.busy ? "Deleting…" : "Delete", t.blocked, t.solid_foreground, t.blocked, (_e, cx) => this.yes(cx))));

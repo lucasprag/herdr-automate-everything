@@ -3,13 +3,16 @@ mod config;
 mod cron;
 mod env;
 mod hc;
+mod host;
 mod history;
 mod lock;
 mod paths;
 mod proc;
+mod remote;
 mod runner;
 mod scheduler;
 mod service;
+mod sync;
 mod tabs;
 
 use std::io::IsTerminal;
@@ -25,6 +28,10 @@ use history::{Run, Status, Trigger};
 #[derive(Parser)]
 #[command(name = "automate-everything", version, about = "Scheduled scripts and agent runs for the Herdr app")]
 struct Cli {
+    /// Ask automate-everything on another herdr-core machine (`hc machine
+    /// ls`) instead: its own config, history and scheduler
+    #[arg(long, global = true, value_name = "MACHINE")]
+    on: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -44,6 +51,15 @@ enum Cmd {
         wait: bool,
         #[arg(long)]
         json: bool,
+        /// The run's id (for `--on`, which picks it before starting the run)
+        #[arg(long, hide = true)]
+        run_id: Option<String>,
+        /// Only check it could run, start nothing (for `--on`)
+        #[arg(long, hide = true)]
+        check: bool,
+        /// Run it on this machine only, whatever its runs_on
+        #[arg(long, hide = true)]
+        here: bool,
     },
     /// Stop scheduling it, keeping the entry
     Pause { name: String },
@@ -56,11 +72,15 @@ enum Cmd {
         #[arg(long)]
         to: usize,
     },
-    /// Remove the entry from the config and delete its history
+    /// Remove the entry from the config and delete its history (here; a
+    /// machine in its runs_on keeps its own)
     Delete {
         name: String,
         #[arg(long)]
         yes: bool,
+        /// Remove only the entry, keeping its run history
+        #[arg(long)]
+        keep_history: bool,
     },
     /// Runs and skips, newest first
     History {
@@ -93,12 +113,22 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// The hc machines an automation can run on (`hc machine ls`)
+    Machines {
+        #[arg(long)]
+        json: bool,
+        /// Also ask each connected one whether it runs automate-everything
+        /// (version, scheduler), so automations can run there (runs_on)
+        #[arg(long)]
+        probe: bool,
+    },
     /// Whether the scheduler is running, and where things live
     Status {
         #[arg(long)]
         json: bool,
     },
-    /// The launchd agent that keeps the scheduler running
+    /// The background service that keeps the scheduler running (launchd on
+    /// macOS, systemd on Linux)
     Service {
         #[command(subcommand)]
         action: service::Action,
@@ -108,8 +138,17 @@ enum Cmd {
         #[command(subcommand)]
         action: tabs::Action,
     },
-    /// Run the scheduler in the foreground (launchd does this)
+    /// Run the scheduler in the foreground (the background service does this)
     Scheduler,
+    /// Replaces the automations another machine sent this one (its
+    /// `runs_on`); the scheduler here fires them
+    #[command(name = "_sync-in", hide = true)]
+    SyncIn {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        toml: String,
+    },
     #[command(name = "_run", hide = true)]
     RunInternal {
         name: String,
@@ -182,13 +221,15 @@ fn list(json_out: bool) -> Result<()> {
                 json!({
                     "name": name, "kind": a.kind.as_str(), "status": status, "paused": a.paused(),
                     "schedule": a.entry.schedule, "timezone": a.tz.name(), "description": a.entry.description,
-                    "grace_minutes": a.grace_minutes(), "error": null,
+                    "grace_minutes": a.grace_minutes(), "machine": a.machine(), "error": null,
+                    "runs_on": a.runs_on(), "origin": a.origin,
                     "next": next, "last": last, "live": live,
                 })
             }
             Slot::Invalid(i) => json!({
                 "name": name, "kind": i.kind, "status": if running { "running" } else { "invalid" }, "paused": i.paused,
-                "schedule": i.schedule, "timezone": null, "description": null, "error": i.error,
+                "schedule": i.schedule, "timezone": null, "description": null, "machine": i.machine, "error": i.error,
+                "runs_on": null, "origin": i.origin,
                 "next": null, "last": last, "live": live,
             }),
         };
@@ -203,7 +244,22 @@ fn list(json_out: bool) -> Result<()> {
         return Ok(());
     }
     let w = items.iter().map(|i| i["name"].as_str().unwrap_or("").len()).max().unwrap_or(4).max(4);
-    println!("{:w$}  {:6}  {:8}  {:34}  {}", "NAME", "KIND", "STATUS", "LAST RUN", "NEXT RUN");
+    // The WHERE column only shows once some entry runs elsewhere: its
+    // machine (fired from here), or its runs_on.
+    let place = |i: &serde_json::Value| -> Option<String> {
+        if let Some(m) = i["machine"].as_str() {
+            return Some(format!("{m} (via here)"));
+        }
+        let places: Vec<&str> = i["runs_on"].as_array()?.iter().filter_map(|p| p.as_str()).collect();
+        (places != [config::LOCAL]).then(|| places.join(","))
+    };
+    let mw = items.iter().filter_map(place).map(|p| p.len()).max().map(|n| n.max(5));
+    let on = |i: &serde_json::Value| match mw {
+        Some(mw) => format!("{:mw$}  ", place(i).unwrap_or_else(|| "local".into())),
+        None => String::new(),
+    };
+    let header = mw.map(|mw| format!("{:mw$}  ", "WHERE")).unwrap_or_default();
+    println!("{:w$}  {:6}  {header}{:8}  {:34}  {}", "NAME", "KIND", "STATUS", "LAST RUN", "NEXT RUN");
     for i in &items {
         let last = match i["last"].as_object() {
             Some(_) => {
@@ -220,9 +276,10 @@ fn list(json_out: bool) -> Result<()> {
             None => "-".into(),
         };
         println!(
-            "{:w$}  {:6}  {:8}  {:34}  {}",
+            "{:w$}  {:6}  {}{:8}  {:34}  {}",
             i["name"].as_str().unwrap_or(""),
             i["kind"].as_str().unwrap_or("?"),
+            on(i),
             i["status"].as_str().unwrap_or(""),
             last,
             next
@@ -234,22 +291,59 @@ fn list(json_out: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_now(name: &str, wait: bool, json_out: bool) -> Result<()> {
+/// Run now, wherever it runs (`runs_on`): here in the background (or
+/// waiting, with `--wait`), and on each machine in a terminal there.
+fn run_now(name: &str, wait: bool, json_out: bool, run_id: Option<String>, check_only: bool, here: bool) -> Result<()> {
     let cfg = config::load()?;
-    match cfg.find(name) {
+    let places = match cfg.find(name) {
         None => bail!("no automation named `{name}`"),
         Some(Slot::Invalid(i)) => bail!("`{name}` is invalid: {}", i.error),
-        Some(Slot::Valid(_)) => {}
+        Some(Slot::Valid(a)) => a.runs_on(),
+    };
+    if check_only {
+        return Ok(());
     }
-    let req = runner::Request {
+    let machines: Vec<&String> = if here { Vec::new() } else { places.iter().filter(|p| *p != config::LOCAL).collect() };
+    let local = here || places.iter().any(|p| p == config::LOCAL);
+    match (local, machines.as_slice()) {
+        (_, []) => run_here(name, wait, json_out, run_id),
+        (false, [m]) if wait => {
+            let mut args = vec!["run".to_string(), name.to_string(), "--wait".to_string()];
+            if json_out {
+                args.push("--json".into());
+            }
+            std::process::exit(remote::proxy(m, &args)?);
+        }
+        _ if wait => bail!("`{name}` runs in more than one place; --wait needs one: add --on <machine>, or run it without --wait"),
+        _ => run_everywhere(name, local, &machines, run_id, json_out),
+    }
+}
+
+/// A manual run of `name`, with the given id or a new one.
+fn manual(name: &str, run_id: Option<String>) -> runner::Request {
+    runner::Request {
         name: name.to_string(),
         trigger: Trigger::Manual,
-        run_id: history::new_id(name),
+        run_id: run_id.unwrap_or_else(|| history::new_id(name)),
         scheduled_for: None,
         caught_up: None,
-    };
+    }
+}
+
+/// Starts a run here in the background; its run id.
+fn start_here(name: &str, run_id: Option<String>) -> Result<String> {
+    let req = manual(name, run_id);
+    paths::ensure_state_dirs()?;
+    let mut child = runner::spawn(&req)?;
+    // Let it get going, so its record exists by the time we return.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let _ = child.try_wait();
+    Ok(req.run_id)
+}
+
+fn run_here(name: &str, wait: bool, json_out: bool, run_id: Option<String>) -> Result<()> {
     if wait {
-        let run = runner::execute(req)?;
+        let run = runner::execute(manual(name, run_id))?;
         if json_out {
             println!("{}", serde_json::to_string_pretty(&run)?);
         } else {
@@ -263,15 +357,47 @@ fn run_now(name: &str, wait: bool, json_out: bool) -> Result<()> {
     if lock::is_held(&paths::automation_lock(name)) && !json_out {
         eprintln!("`{name}` is still running; this run will be recorded as skipped_overlap");
     }
-    paths::ensure_state_dirs()?;
-    let mut child = runner::spawn(&req)?;
-    // Let it get going, so its record exists by the time we return.
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    let _ = child.try_wait();
+    let run_id = start_here(name, run_id)?;
     if json_out {
-        println!("{}", json!({ "run_id": req.run_id }));
+        println!("{}", json!({ "run_id": run_id }));
     } else {
-        println!("started {} ({})", name, req.run_id);
+        println!("started {name} ({run_id})");
+    }
+    Ok(())
+}
+
+/// Starts it here (when `local`) and on each machine; says where it couldn't.
+fn run_everywhere(name: &str, local: bool, machines: &[&String], run_id: Option<String>, json_out: bool) -> Result<()> {
+    let mut runs = Vec::new();
+    let mut errors = Vec::new();
+    if local {
+        runs.push(json!({ "on": null, "run_id": start_here(name, run_id)? }));
+    }
+    // Asked once for all of them.
+    let listed = hc::machines();
+    for m in machines {
+        let ready = match &listed {
+            Ok(l) => remote::reachable_in(l, m),
+            Err(e) => Err(anyhow!("{e:#}")),
+        };
+        match ready.and_then(|_| remote::start_run(m, name)) {
+            Ok(id) => runs.push(json!({ "on": m, "run_id": id })),
+            Err(e) => errors.push(format!("{m}: {e:#}")),
+        }
+    }
+    if runs.is_empty() {
+        bail!("{}", errors.join("; "));
+    }
+    if json_out {
+        println!("{}", json!({ "run_id": runs[0]["run_id"], "runs": runs, "errors": errors }));
+    } else {
+        for r in &runs {
+            let on = r["on"].as_str().map(|m| format!(" on {m}")).unwrap_or_default();
+            println!("started {name}{on} ({})", r["run_id"].as_str().unwrap_or(""));
+        }
+        for e in &errors {
+            eprintln!("not started on {e}");
+        }
     }
     Ok(())
 }
@@ -297,6 +423,9 @@ fn output_of(r: &Run) -> serde_json::Value {
 
 fn print_run(r: &Run, with_output: bool) -> Result<()> {
     println!("{}  {}  {}  {}", r.id, r.automation, r.trigger.as_str(), r.status.as_str());
+    if let Some(m) = &r.machine {
+        println!("  machine        {m}");
+    }
     if let Some(t) = r.scheduled_for {
         println!("  scheduled for  {}", local(t));
     }
@@ -380,10 +509,14 @@ fn history_cmd(name: Option<String>, limit: usize, json_out: bool) -> Result<()>
     }
     for r in &runs {
         let dur = r.duration_ms.map(|ms| format!("{:.0}s", ms as f64 / 1000.0)).unwrap_or_default();
+        let name = match &r.machine {
+            Some(m) => format!("{}@{m}", r.automation),
+            None => r.automation.clone(),
+        };
         println!(
             "{:16}  {:26}  {:9}  {:16}  {:>6}  {}",
             local(run_time(r)),
-            r.automation,
+            name,
             r.trigger.as_str(),
             r.status.as_str(),
             dur,
@@ -413,27 +546,199 @@ fn get_entry(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether hc knows `machine`, given `hc machine ls`: Err for an unknown
+/// one, Ok(Some(warning)) when it's known but not connected or hc couldn't
+/// be asked.
+fn machine_known(machine: &str, listed: &Result<Vec<serde_json::Value>, String>) -> Result<Option<String>> {
+    let machines = match listed {
+        Ok(m) => m,
+        Err(e) => return Ok(Some(format!("could not check machine `{machine}`: {e}"))),
+    };
+    let Some(m) = machines.iter().find(|m| m["name"].as_str() == Some(machine)) else {
+        let known: Vec<&str> = machines.iter().filter_map(|m| m["name"].as_str()).collect();
+        let hint = if known.is_empty() {
+            "hc has no machines; add one with `hc machine add`".to_string()
+        } else {
+            format!("known: {}", known.join(", "))
+        };
+        bail!("unknown machine `{machine}` ({hint})");
+    };
+    let state = m["state"].as_str().unwrap_or("unknown");
+    Ok((state != "connected").then(|| format!("machine `{machine}` is {state} right now")))
+}
+
+/// For an entry that runs on a machine: the machine is known, and, when it
+/// can be reached, its paths are there. Errors, then warnings.
+fn check_machine(
+    a: &config::Automation,
+    listed: &Result<Vec<serde_json::Value>, String>,
+) -> (Vec<String>, Vec<String>) {
+    let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+    let Some(m) = a.machine() else { return (errors, warnings) };
+    match machine_known(m, listed) {
+        Err(e) => {
+            errors.push(format!("{e:#}"));
+            return (errors, warnings);
+        }
+        Ok(Some(w)) => {
+            warnings.push(w);
+            return (errors, warnings);
+        }
+        Ok(None) => {}
+    }
+    let host = match host::Host::connect(Some(m)) {
+        Ok(h) => h,
+        Err(e) => {
+            warnings.push(format!("{e:#}"));
+            return (errors, warnings);
+        }
+    };
+    // The same checks as for a local entry, made on the machine.
+    let mut want = |field: &str, path: Option<&String>, file: bool| {
+        let Some(p) = path else { return };
+        let full = host.expand(p);
+        let (found, what) = if file { (host.is_file(&full), "a file") } else { (host.is_dir(&full), "a folder") };
+        match found {
+            Some(true) => {}
+            Some(false) => errors.push(format!("{field} `{}` is not {what} on `{m}`", full.display())),
+            None => warnings.push(format!("could not check {field} on `{m}`")),
+        }
+    };
+    want("cwd", a.entry.cwd.as_ref(), false);
+    want("repo", a.entry.repo.as_ref(), false);
+    want("prompt_file", a.entry.prompt_file.as_ref(), true);
+    (errors, warnings)
+}
+
+/// The copies this machine sent, as each machine in a runs_on sees them: its
+/// paths and fields can only be judged there. Invalid ones, then machines
+/// that couldn't be asked.
+fn check_copies(
+    cfg: &config::Config,
+    listed: &Result<Vec<serde_json::Value>, String>,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let (mut invalid, mut warnings) = (Vec::new(), Vec::new());
+    let mut machines: Vec<String> = cfg
+        .valid()
+        .filter(|a| a.origin.is_none())
+        .flat_map(|a| a.runs_on())
+        .filter(|p| p != config::LOCAL)
+        .collect();
+    machines.sort();
+    machines.dedup();
+    let source = sync::source_id();
+    for m in machines {
+        let asked = match listed {
+            Ok(l) => remote::reachable_in(l, &m).and_then(|_| remote::call(&m, &["list".into(), "--json".into()])),
+            Err(e) => Err(anyhow!("{e}")),
+        };
+        let items: Vec<serde_json::Value> = match asked {
+            Ok(o) if o.ok() => serde_json::from_slice(&o.stdout).unwrap_or_default(),
+            Ok(o) => {
+                warnings.push(json!({ "name": m, "warning": format!("could not check its copies on `{m}`: {}", o.stderr_text()) }));
+                continue;
+            }
+            Err(e) => {
+                warnings.push(json!({ "name": m, "warning": format!("could not check its copies on `{m}`: {e:#}") }));
+                continue;
+            }
+        };
+        for i in items.iter().filter(|i| i["origin"].as_str() == Some(source.as_str())) {
+            if let Some(e) = i["error"].as_str() {
+                invalid.push(json!({ "name": i["name"], "error": format!("on `{m}`: {e}"), "machine": m }));
+            }
+        }
+    }
+    (invalid, warnings)
+}
+
 fn check(json_out: bool) -> Result<()> {
     let cfg = config::load()?;
-    let invalid: Vec<_> = cfg
-        .slots
-        .iter()
-        .filter_map(|s| match s {
-            Slot::Invalid(i) => Some(json!({ "name": i.name, "error": i.error })),
-            _ => None,
-        })
-        .collect();
-    if json_out {
-        println!("{}", json!({ "ok": invalid.is_empty(), "count": cfg.slots.len(), "invalid": invalid }));
-    } else if invalid.is_empty() {
-        println!("{} automations, all valid", cfg.slots.len());
+    let mut invalid = Vec::new();
+    let mut warnings = Vec::new();
+    // Asked once, and only when some entry runs elsewhere.
+    let elsewhere = |a: &config::Automation| a.machine().is_some() || !a.runs_here() || a.runs_on().len() > 1;
+    let listed = if cfg.valid().any(elsewhere) {
+        hc::machines().map_err(|e| format!("{e:#}"))
     } else {
+        Ok(Vec::new())
+    };
+    for s in &cfg.slots {
+        match s {
+            Slot::Invalid(i) => invalid.push(json!({ "name": i.name, "error": i.error })),
+            Slot::Valid(a) => {
+                let (mut errors, mut warns) = check_machine(a, &listed);
+                for m in a.runs_on().iter().filter(|p| *p != config::LOCAL) {
+                    match machine_known(m, &listed) {
+                        Err(e) => errors.push(format!("runs_on: {e:#}")),
+                        Ok(Some(w)) => warns.push(format!("runs_on: {w}")),
+                        Ok(None) => {}
+                    }
+                }
+                invalid.extend(errors.iter().map(|e| json!({ "name": a.name, "error": e })));
+                warnings.extend(warns.iter().map(|w| json!({ "name": a.name, "warning": w })));
+            }
+        }
+    }
+    let (bad, warns) = check_copies(&cfg, &listed);
+    invalid.extend(bad);
+    warnings.extend(warns);
+    if json_out {
+        println!(
+            "{}",
+            json!({ "ok": invalid.is_empty(), "count": cfg.slots.len(), "invalid": invalid, "warnings": warnings })
+        );
+    } else {
+        if invalid.is_empty() {
+            println!("{} automations, all valid", cfg.slots.len());
+        }
         for i in &invalid {
             println!("{}: {}", i["name"].as_str().unwrap_or(""), i["error"].as_str().unwrap_or(""));
+        }
+        for w in &warnings {
+            println!("{}: warning: {}", w["name"].as_str().unwrap_or(""), w["warning"].as_str().unwrap_or(""));
         }
     }
     if !invalid.is_empty() {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn machines(json_out: bool, probe: bool) -> Result<()> {
+    let machines = hc::machines()?;
+    let mut v: Vec<_> = machines.iter().map(|m| json!({ "name": m["name"], "state": m["state"] })).collect();
+    if probe {
+        remote::probe_all(&mut v);
+    }
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    for m in &v {
+        let ae = &m["automate_everything"];
+        let extra = if !probe {
+            String::new()
+        } else if let Some(e) = ae["error"].as_str() {
+            format!("  ({e})")
+        } else if ae["installed"] == true {
+            let sched = if ae["scheduler_running"] == true { "scheduler running" } else { "scheduler not running" };
+            format!("  automate-everything {} ({sched})", ae["version"].as_str().unwrap_or("?"))
+        } else if ae["installed"] == false {
+            "  no automate-everything".into()
+        } else {
+            String::new()
+        };
+        println!("{}  {}{extra}", m["name"].as_str().unwrap_or(""), m["state"].as_str().unwrap_or(""));
+    }
+    Ok(())
+}
+
+/// Changes go to where an automation is defined: a copy another machine sent
+/// is changed there.
+fn not_a_copy(name: &str) -> Result<()> {
+    if let Some(origin) = config::load()?.find(name).and_then(|s| s.origin().map(String::from)) {
+        bail!("`{name}` is defined on `{origin}`, which sends it here: change it there");
     }
     Ok(())
 }
@@ -444,7 +749,12 @@ fn status(json_out: bool) -> Result<()> {
     let v = json!({
         "scheduler_running": running,
         "scheduler": if running { note } else { None },
-        "service_installed": service::plist_path().exists(),
+        "service_installed": service::installed(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol": remote::PROTOCOL,
+        "timezone": cron::system_tz().name(),
+        "source_id": sync::source_id(),
+        "sent": sync::sent_status(),
         "config": paths::config_file(),
         "state": paths::state_dir(),
         "log": paths::scheduler_log(),
@@ -460,37 +770,62 @@ fn status(json_out: bool) -> Result<()> {
         println!("config     {}", paths::config_file().display());
         println!("state      {}", paths::state_dir().display());
         println!("log        {}", paths::scheduler_log().display());
+        // Not in --json: the panel polls that, and on Linux this asks loginctl.
+        for w in service::warnings() {
+            println!("warning    {w}");
+        }
     }
     Ok(())
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(m) = &cli.on {
+        match &cli.cmd {
+            Cmd::Scheduler | Cmd::RunInternal { .. } | Cmd::SyncIn { .. } => bail!("--on doesn't apply to this command"),
+            _ => {
+                let args = remote::strip_on(std::env::args().skip(1), m);
+                std::process::exit(remote::proxy(m, &args)?);
+            }
+        }
+    }
     match cli.cmd {
         Cmd::List { json } => list(json),
-        Cmd::Run { name, wait, json } => run_now(&name, wait, json),
+        Cmd::Run { name, wait, json, run_id, check, here } => run_now(&name, wait, json, run_id, check, here),
         Cmd::Pause { name } => {
+            not_a_copy(&name)?;
             config::set_paused(&name, true)?;
             println!("paused {name}");
+            sync::send_and_report();
             Ok(())
         }
         Cmd::Resume { name } => {
+            not_a_copy(&name)?;
             config::set_paused(&name, false)?;
             println!("resumed {name}");
+            sync::send_and_report();
             Ok(())
         }
         Cmd::Move { name, to } => {
+            not_a_copy(&name)?;
             config::move_to(&name, to)?;
             println!("moved {name} to {to}");
             Ok(())
         }
-        Cmd::Delete { name, yes } => {
-            if !yes && !confirm(&format!("Delete `{name}` and its run history?")) {
+        Cmd::Delete { name, yes, keep_history } => {
+            not_a_copy(&name)?;
+            let what = if keep_history { "" } else { " and its run history" };
+            if !yes && !confirm(&format!("Delete `{name}`{what}?")) {
                 bail!("not deleted (pass --yes to skip the question)");
             }
             config::remove(&name)?;
-            let n = history::delete_for(&name);
-            println!("deleted {name} and {n} history records");
+            if keep_history {
+                println!("deleted {name}, kept its history");
+            } else {
+                let n = history::delete_for(&name);
+                println!("deleted {name} and {n} history records");
+            }
+            sync::send_and_report();
             Ok(())
         }
         Cmd::History { name, limit, json } => history_cmd(name, limit, json),
@@ -509,15 +844,34 @@ fn main() -> Result<()> {
         Cmd::Set { name, fields, create } => {
             let v: serde_json::Value = serde_json::from_str(&fields).context("--fields must be a JSON object")?;
             let obj = v.as_object().ok_or_else(|| anyhow!("--fields must be a JSON object"))?;
+            let mut named: Vec<&str> = obj.get("machine").and_then(|m| m.as_str()).into_iter().collect();
+            if let Some(places) = obj.get("runs_on").and_then(|v| v.as_array()) {
+                named.extend(places.iter().filter_map(|p| p.as_str()).filter(|p| *p != config::LOCAL));
+            }
+            if named.iter().any(|m| config::valid_machine(m)) {
+                let listed = hc::machines().map_err(|e| format!("{e:#}"));
+                for m in named.iter().filter(|m| config::valid_machine(m)) {
+                    if let Some(w) = machine_known(m, &listed)? {
+                        eprintln!("warning: {w}");
+                    }
+                }
+            }
+            not_a_copy(&name)?;
             config::upsert(&name, obj, create)?;
             println!("saved {name}");
+            sync::send_and_report();
             Ok(())
         }
         Cmd::Check { json } => check(json),
         Cmd::Status { json } => status(json),
+        Cmd::Machines { json, probe } => machines(json, probe),
         Cmd::Service { action } => service::run(action),
         Cmd::Tab { action } => tabs::run(action),
         Cmd::Scheduler => scheduler::serve(),
+        Cmd::SyncIn { from, toml } => {
+            println!("{}", sync::receive(&from, &toml)?);
+            Ok(())
+        }
         Cmd::RunInternal { name, run_id, trigger, scheduled_for, caught_up } => {
             let trigger = match trigger.as_str() {
                 "scheduled" => Trigger::Scheduled,
