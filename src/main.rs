@@ -3,6 +3,7 @@ mod config;
 mod cron;
 mod env;
 mod hc;
+mod host;
 mod history;
 mod lock;
 mod paths;
@@ -90,6 +91,11 @@ enum Cmd {
     },
     /// Check the config and report invalid entries
     Check {
+        #[arg(long)]
+        json: bool,
+    },
+    /// The hc machines an automation can run on (`hc machine ls`)
+    Machines {
         #[arg(long)]
         json: bool,
     },
@@ -182,13 +188,13 @@ fn list(json_out: bool) -> Result<()> {
                 json!({
                     "name": name, "kind": a.kind.as_str(), "status": status, "paused": a.paused(),
                     "schedule": a.entry.schedule, "timezone": a.tz.name(), "description": a.entry.description,
-                    "grace_minutes": a.grace_minutes(), "error": null,
+                    "grace_minutes": a.grace_minutes(), "machine": a.machine(), "error": null,
                     "next": next, "last": last, "live": live,
                 })
             }
             Slot::Invalid(i) => json!({
                 "name": name, "kind": i.kind, "status": if running { "running" } else { "invalid" }, "paused": i.paused,
-                "schedule": i.schedule, "timezone": null, "description": null, "error": i.error,
+                "schedule": i.schedule, "timezone": null, "description": null, "machine": i.machine, "error": i.error,
                 "next": null, "last": last, "live": live,
             }),
         };
@@ -203,7 +209,14 @@ fn list(json_out: bool) -> Result<()> {
         return Ok(());
     }
     let w = items.iter().map(|i| i["name"].as_str().unwrap_or("").len()).max().unwrap_or(4).max(4);
-    println!("{:w$}  {:6}  {:8}  {:34}  {}", "NAME", "KIND", "STATUS", "LAST RUN", "NEXT RUN");
+    // The MACHINE column only shows once some entry runs elsewhere.
+    let mw = items.iter().filter_map(|i| i["machine"].as_str()).map(str::len).max().map(|n| n.max(7));
+    let on = |i: &serde_json::Value| match mw {
+        Some(mw) => format!("{:mw$}  ", i["machine"].as_str().unwrap_or("-")),
+        None => String::new(),
+    };
+    let header = mw.map(|mw| format!("{:mw$}  ", "MACHINE")).unwrap_or_default();
+    println!("{:w$}  {:6}  {header}{:8}  {:34}  {}", "NAME", "KIND", "STATUS", "LAST RUN", "NEXT RUN");
     for i in &items {
         let last = match i["last"].as_object() {
             Some(_) => {
@@ -220,9 +233,10 @@ fn list(json_out: bool) -> Result<()> {
             None => "-".into(),
         };
         println!(
-            "{:w$}  {:6}  {:8}  {:34}  {}",
+            "{:w$}  {:6}  {}{:8}  {:34}  {}",
             i["name"].as_str().unwrap_or(""),
             i["kind"].as_str().unwrap_or("?"),
+            on(i),
             i["status"].as_str().unwrap_or(""),
             last,
             next
@@ -297,6 +311,9 @@ fn output_of(r: &Run) -> serde_json::Value {
 
 fn print_run(r: &Run, with_output: bool) -> Result<()> {
     println!("{}  {}  {}  {}", r.id, r.automation, r.trigger.as_str(), r.status.as_str());
+    if let Some(m) = &r.machine {
+        println!("  machine        {m}");
+    }
     if let Some(t) = r.scheduled_for {
         println!("  scheduled for  {}", local(t));
     }
@@ -380,10 +397,14 @@ fn history_cmd(name: Option<String>, limit: usize, json_out: bool) -> Result<()>
     }
     for r in &runs {
         let dur = r.duration_ms.map(|ms| format!("{:.0}s", ms as f64 / 1000.0)).unwrap_or_default();
+        let name = match &r.machine {
+            Some(m) => format!("{}@{m}", r.automation),
+            None => r.automation.clone(),
+        };
         println!(
             "{:16}  {:26}  {:9}  {:16}  {:>6}  {}",
             local(run_time(r)),
-            r.automation,
+            name,
             r.trigger.as_str(),
             r.status.as_str(),
             dur,
@@ -413,27 +434,121 @@ fn get_entry(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether hc knows `machine`, given `hc machine ls`: Err for an unknown
+/// one, Ok(Some(warning)) when it's known but not connected or hc couldn't
+/// be asked.
+fn machine_known(machine: &str, listed: &Result<Vec<serde_json::Value>, String>) -> Result<Option<String>> {
+    let machines = match listed {
+        Ok(m) => m,
+        Err(e) => return Ok(Some(format!("could not check machine `{machine}`: {e}"))),
+    };
+    let Some(m) = machines.iter().find(|m| m["name"].as_str() == Some(machine)) else {
+        let known: Vec<&str> = machines.iter().filter_map(|m| m["name"].as_str()).collect();
+        let hint = if known.is_empty() {
+            "hc has no machines; add one with `hc machine add`".to_string()
+        } else {
+            format!("known: {}", known.join(", "))
+        };
+        bail!("unknown machine `{machine}` ({hint})");
+    };
+    let state = m["state"].as_str().unwrap_or("unknown");
+    Ok((state != "connected").then(|| format!("machine `{machine}` is {state} right now")))
+}
+
+/// For an entry that runs on a machine: the machine is known, and, when it
+/// can be reached, its paths are there. Errors, then warnings.
+fn check_machine(
+    a: &config::Automation,
+    listed: &Result<Vec<serde_json::Value>, String>,
+) -> (Vec<String>, Vec<String>) {
+    let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+    let Some(m) = a.machine() else { return (errors, warnings) };
+    match machine_known(m, listed) {
+        Err(e) => {
+            errors.push(format!("{e:#}"));
+            return (errors, warnings);
+        }
+        Ok(Some(w)) => {
+            warnings.push(w);
+            return (errors, warnings);
+        }
+        Ok(None) => {}
+    }
+    let host = match host::Host::connect(Some(m)) {
+        Ok(h) => h,
+        Err(e) => {
+            warnings.push(format!("{e:#}"));
+            return (errors, warnings);
+        }
+    };
+    // The same checks as for a local entry, made on the machine.
+    let mut want = |field: &str, path: Option<&String>, file: bool| {
+        let Some(p) = path else { return };
+        let full = host.expand(p);
+        let (found, what) = if file { (host.is_file(&full), "a file") } else { (host.is_dir(&full), "a folder") };
+        match found {
+            Some(true) => {}
+            Some(false) => errors.push(format!("{field} `{}` is not {what} on `{m}`", full.display())),
+            None => warnings.push(format!("could not check {field} on `{m}`")),
+        }
+    };
+    want("cwd", a.entry.cwd.as_ref(), false);
+    want("repo", a.entry.repo.as_ref(), false);
+    want("prompt_file", a.entry.prompt_file.as_ref(), true);
+    (errors, warnings)
+}
+
 fn check(json_out: bool) -> Result<()> {
     let cfg = config::load()?;
-    let invalid: Vec<_> = cfg
-        .slots
-        .iter()
-        .filter_map(|s| match s {
-            Slot::Invalid(i) => Some(json!({ "name": i.name, "error": i.error })),
-            _ => None,
-        })
-        .collect();
-    if json_out {
-        println!("{}", json!({ "ok": invalid.is_empty(), "count": cfg.slots.len(), "invalid": invalid }));
-    } else if invalid.is_empty() {
-        println!("{} automations, all valid", cfg.slots.len());
+    let mut invalid = Vec::new();
+    let mut warnings = Vec::new();
+    // Asked once, and only when some entry runs elsewhere.
+    let listed = if cfg.valid().any(|a| a.machine().is_some()) {
+        hc::machines().map_err(|e| format!("{e:#}"))
     } else {
+        Ok(Vec::new())
+    };
+    for s in &cfg.slots {
+        match s {
+            Slot::Invalid(i) => invalid.push(json!({ "name": i.name, "error": i.error })),
+            Slot::Valid(a) => {
+                let (errors, warns) = check_machine(a, &listed);
+                invalid.extend(errors.iter().map(|e| json!({ "name": a.name, "error": e })));
+                warnings.extend(warns.iter().map(|w| json!({ "name": a.name, "warning": w })));
+            }
+        }
+    }
+    if json_out {
+        println!(
+            "{}",
+            json!({ "ok": invalid.is_empty(), "count": cfg.slots.len(), "invalid": invalid, "warnings": warnings })
+        );
+    } else {
+        if invalid.is_empty() {
+            println!("{} automations, all valid", cfg.slots.len());
+        }
         for i in &invalid {
             println!("{}: {}", i["name"].as_str().unwrap_or(""), i["error"].as_str().unwrap_or(""));
+        }
+        for w in &warnings {
+            println!("{}: warning: {}", w["name"].as_str().unwrap_or(""), w["warning"].as_str().unwrap_or(""));
         }
     }
     if !invalid.is_empty() {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn machines(json_out: bool) -> Result<()> {
+    let machines = hc::machines()?;
+    if json_out {
+        let v: Vec<_> = machines.iter().map(|m| json!({ "name": m["name"], "state": m["state"] })).collect();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    for m in &machines {
+        println!("{}  {}", m["name"].as_str().unwrap_or(""), m["state"].as_str().unwrap_or(""));
     }
     Ok(())
 }
@@ -509,12 +624,20 @@ fn main() -> Result<()> {
         Cmd::Set { name, fields, create } => {
             let v: serde_json::Value = serde_json::from_str(&fields).context("--fields must be a JSON object")?;
             let obj = v.as_object().ok_or_else(|| anyhow!("--fields must be a JSON object"))?;
+            if let Some(m) = obj.get("machine").and_then(|m| m.as_str()) {
+                if config::valid_machine(m) {
+                    if let Some(w) = machine_known(m, &hc::machines().map_err(|e| format!("{e:#}")))? {
+                        eprintln!("warning: {w}");
+                    }
+                }
+            }
             config::upsert(&name, obj, create)?;
             println!("saved {name}");
             Ok(())
         }
         Cmd::Check { json } => check(json),
         Cmd::Status { json } => status(json),
+        Cmd::Machines { json } => machines(json),
         Cmd::Service { action } => service::run(action),
         Cmd::Tab { action } => tabs::run(action),
         Cmd::Scheduler => scheduler::serve(),

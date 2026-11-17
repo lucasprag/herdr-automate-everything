@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 
 use crate::config::{self, Automation, Kind, Slot};
 use crate::history::{Run, Status, Trigger};
+use crate::host::Host;
 use crate::lock::{self, FileLock};
 use crate::{agent, env, paths, proc};
 
@@ -23,12 +24,26 @@ pub struct Request {
     pub caught_up: Option<u32>,
 }
 
-pub fn run_env(a: &Automation, run: &Run) -> BTreeMap<String, String> {
-    let mut e = env::login_env();
-    e.extend(a.env());
+/// What a run sets on top of the login environment: the entry's `env` and
+/// the `HERDR_AUTOMATION*` variables.
+pub fn run_vars(a: &Automation, run: &Run) -> BTreeMap<String, String> {
+    let mut e = a.env();
     e.insert("HERDR_AUTOMATION".into(), a.name.clone());
     e.insert("HERDR_AUTOMATION_RUN_ID".into(), run.id.clone());
     e.insert("HERDR_AUTOMATION_TRIGGER".into(), run.trigger.as_str().into());
+    e
+}
+
+/// The labels on every terminal a run starts, which closing and reaping
+/// look for.
+pub fn run_labels(a: &Automation, run: &Run) -> Vec<(String, String)> {
+    vec![("automation".to_string(), a.name.clone()), (agent::RUN_LABEL.to_string(), run.id.clone())]
+}
+
+/// This Mac's login environment plus `run_vars`.
+pub fn run_env(a: &Automation, run: &Run) -> BTreeMap<String, String> {
+    let mut e = env::login_env();
+    e.extend(run_vars(a, run));
     e
 }
 
@@ -51,6 +66,9 @@ pub fn execute(req: Request) -> Result<Run> {
     run.scheduled_for = req.scheduled_for;
     run.caught_up = req.caught_up.filter(|n| *n > 0);
     run.runner_pid = Some(std::process::id());
+    if let Some(Slot::Valid(a)) = &slot {
+        run.machine = a.machine().map(String::from);
+    }
 
     let automation = match (cfg, slot) {
         (Err(e), _) => {
@@ -91,10 +109,12 @@ pub fn execute(req: Request) -> Result<Run> {
     run.started_at = Some(Utc::now());
     run.save()?;
 
-    let result = match automation.kind {
-        Kind::Script => run_script(&automation, &mut run),
-        Kind::Agent => agent::run(&automation, &mut run),
-    };
+    // Reaching the machine is the run's first step: an unreachable one fails
+    // the run with that as its note.
+    let result = Host::connect(automation.machine()).and_then(|host| match automation.kind {
+        Kind::Script => run_script(&automation, &host, &mut run),
+        Kind::Agent => agent::run(&automation, &host, &mut run),
+    });
     if let Err(e) = result {
         run.note = Some(match run.note.take() {
             Some(n) => format!("{n}; {e:#}"),
@@ -109,22 +129,38 @@ pub fn execute(req: Request) -> Result<Run> {
     Ok(run)
 }
 
-fn run_script(a: &Automation, run: &mut Run) -> Result<()> {
-    let env = run_env(a, run);
+fn run_script(a: &Automation, host: &Host, run: &mut Run) -> Result<()> {
     let command = a.entry.command.clone().unwrap_or_default();
-    let cmd = shell_command(&command, &a.script_cwd(), &env);
+    let cwd = a.script_cwd(host);
+    let timeout = Duration::from_secs(a.timeout_seconds());
     let dir = run.dir();
-    let out = proc::run_to_files(
-        cmd,
-        &dir.join("stdout.log"),
-        &dir.join("stderr.log"),
-        Duration::from_secs(a.timeout_seconds()),
-    )?;
+    let out = match host {
+        Host::Local => {
+            let cmd = shell_command(&command, &cwd, &run_env(a, run));
+            proc::run_to_files(cmd, &dir.join("stdout.log"), &dir.join("stderr.log"), timeout)?
+        }
+        Host::Remote(r) => {
+            let r = r.run_command(&run.id, &cwd, &command, &run_vars(a, run), timeout, &run_labels(a, run))?;
+            let c = r.out;
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("stdout.log"), &c.stdout)?;
+            std::fs::write(dir.join("stderr.log"), &c.stderr)?;
+            if let Some(e) = r.error {
+                run.note = Some(e);
+                run.finish(Status::Failed);
+                return Ok(());
+            }
+            proc::Outcome { exit_code: c.exit_code, signal: c.signal, timed_out: c.timed_out }
+        }
+    };
     run.exit_code = out.exit_code;
     run.signal = out.signal;
     run.timed_out = out.timed_out;
     if out.timed_out {
-        run.note = Some(format!("stopped after the {} timeout", agent::human_secs(a.timeout_seconds())));
+        run.note = Some(match host.machine() {
+            Some(m) => format!("stopped on `{m}` after the {} timeout", agent::human_secs(a.timeout_seconds())),
+            None => format!("stopped after the {} timeout", agent::human_secs(a.timeout_seconds())),
+        });
     }
     let ok = out.exit_code == Some(0) && !out.timed_out;
     run.finish(if ok { Status::Succeeded } else { Status::Failed });

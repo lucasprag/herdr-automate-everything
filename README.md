@@ -166,7 +166,7 @@ Requirements: [docs/requirements.md](docs/requirements.md).
 | Config | `~/.config/automate-everything/automations.toml` |
 | History, locks, logs | `~/.local/state/automate-everything/` (`runs/<id>/run.json`, `stdout.log`, `stderr.log`, `agent.log`) |
 | Background service | `~/Library/LaunchAgents/com.lucasprag.automate-everything.plist` |
-| Worktrees | `~/.herdr/worktrees/<repo>/automation/<name>/<stamp>` |
+| Worktrees | `~/.herdr/worktrees/<repo>/automation/<name>/<stamp>` (on the run's machine) |
 
 ## Config file
 
@@ -212,6 +212,21 @@ Every run gets the environment variables `HERDR_AUTOMATION`,
 `HERDR_AUTOMATION_RUN_ID` and `HERDR_AUTOMATION_TRIGGER` (`scheduled` or
 `manual`).
 
+### Running on another machine
+
+`machine` runs an entry on another herdr-core machine, one that
+`hc machine ls` lists. Its `command`, `cwd`, `repo`, `precheck` and
+`prompt_file` are paths on that machine, `~` being its home. Leave it out to
+run on this Mac.
+
+```toml
+[automations.lab-probe]
+kind = "script"
+schedule = "*/30 * * * *"
+machine = "lab"                # default: this Mac
+command = "uname -a; hostname"
+```
+
 ## How runs behave, in detail
 
 - **Scripts** run in the background with no space. Output and exit code go into
@@ -242,6 +257,11 @@ Every run gets the environment variables `HERDR_AUTOMATION`,
 - **One run at a time** per automation, held by a lock for as long as the run
   lasts, a blocked one included. A scheduled time that comes up meanwhile is
   recorded as skipped overlap.
+- **On another machine** the run gets that machine's login environment, not
+  this Mac's. A script's output comes back into its record as usual, and a
+  timeout stops it there. An agent's space shows under that machine. If the
+  machine can't be reached, the run fails and says so. Scheduling stays on
+  this Mac, so nothing runs while it sleeps.
 - **Catching up after sleep:** the newest missed time runs once if it's inside
   the grace window; otherwise one missed record covers them all. Daylight
   saving: a fixed-time automation runs once when clocks go back and isn't lost
@@ -254,10 +274,11 @@ automate-everything list | run <name> [--wait] | pause <name> | resume <name> | 
 automate-everything move <name> --to <position>
 automate-everything history [<name>] | show <run-id>
 automate-everything get <name> | set <name> --fields '<json>' [--create] | check
-automate-everything status | service install|uninstall|restart | scheduler
+automate-everything status | machines | service install|uninstall|restart | scheduler
 ```
 
-Add `--json` to `list`, `history` and `show` for machine-readable output.
+Add `--json` to `list`, `history`, `show`, `check` and `machines` for
+machine-readable output.
 
 ### Extra tabs from an agent run
 
@@ -336,9 +357,6 @@ Some bigger things that would be great to have:
 - **Windows support.** Same idea with a Windows service or Task Scheduler,
   plus Windows builds. Agent runs go through herdr-core, which also runs on
   Windows.
-- **Automations on another machine.** herdr-core can run terminals on other
-  machines (`hc run --on <machine>`), so an automation could pick where it
-  runs.
 
 You don't need Rust to make a difference here. The panel is plain JavaScript
 (`app/mods/automate-everything/`: `panel.js`, `edit.js`, `popups.js`) and Herdr

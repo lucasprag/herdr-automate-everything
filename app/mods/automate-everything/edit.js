@@ -49,7 +49,9 @@ export class Edit {
     this.error = null;
     this.saving = false;
     this.loaded = this.creating;
-    this.choice = { kind: "script", directory: "repo", space: "per-run" };
+    this.choice = { kind: "script", directory: "repo", space: "per-run", machine: null };
+    // hc's machines, for the picker; [] until known (or when hc has none).
+    this.machines = [];
     this.handle = cx.focus_handle();
     this.nameInput = InputState.new({ placeholder: "my-automation (letters, digits, - _ .)" });
     this.inputs = {};
@@ -62,6 +64,12 @@ export class Edit {
         this.inputs[key] = InputState.new({ placeholder });
       }
     }
+    cx.spawn(async (cx) => {
+      try {
+        this.machines = await cli.machines();
+      } catch {}
+      cx.notify();
+    });
     if (this.creating) {
       this.nameInput.focus();
       return;
@@ -72,6 +80,7 @@ export class Edit {
         this.choice.kind = entry.kind ?? "script";
         this.choice.directory = entry.directory ?? "repo";
         this.choice.space = entry.space ?? "per-run";
+        this.choice.machine = entry.machine ?? null;
         for (const [key] of FIELDS) this.inputs[key].set_value(toText(key, entry[key]));
         // What the form shows now, so Save sends only what changed.
         try { this.original = this.fields(); } catch { this.original = {}; }
@@ -94,7 +103,7 @@ export class Edit {
   // The fields to send: every field, null where empty or not for this kind,
   // so `set` removes what was cleared.
   fields() {
-    const out = { kind: this.choice.kind };
+    const out = { kind: this.choice.kind, machine: this.choice.machine ?? null };
     const agent = this.choice.kind === "agent";
     out.directory = agent && this.choice.directory === "worktree" ? "worktree" : null;
     out.space = agent && this.choice.space === "shared" ? "shared" : null;
@@ -159,16 +168,33 @@ export class Edit {
     });
   }
 
-  segmented(t, key) {
-    return h_flex().gap(0).children(CHOICES[key].map(([value, label]) => {
+  segmented(t, key, options = CHOICES[key]) {
+    return h_flex().gap(0).children(options.map(([value, label]) => {
       const on = this.choice[key] === value;
-      return h_flex().id(`seg-${key}-${value}`).h(30).px(12).items_center().cursor_pointer()
+      // "/" can't be in a machine name, so This Mac (null) can't clash with one.
+      return h_flex().id(`seg-${key}-${value ?? "/local"}`).h(30).px(12).items_center().cursor_pointer()
         .border_1().border_color(on ? t.accent : t.input).bg(on ? t.selected : t.background)
         .text_size(12).text_color(on ? t.foreground : t.muted)
         .hover((s) => s.text_color(t.foreground))
         .on_click((_e, cx) => { this.choice[key] = value; cx.notify(); })
         .child(label);
     }));
+  }
+
+  // "This Mac", then each hc machine (with its state when not connected),
+  // plus the entry's own machine if hc doesn't list it (any more).
+  machinePicker(t) {
+    const options = [[null, "This Mac"]];
+    for (const m of this.machines) {
+      options.push([m.name, m.state && m.state !== "connected" ? `${m.name} (${m.state})` : m.name]);
+    }
+    const cur = this.choice.machine;
+    if (cur && !this.machines.some((m) => m.name === cur)) options.push([cur, `${cur} (unknown)`]);
+    const picker = this.segmented(t, "machine", options);
+    if (!cur) return picker;
+    return v_flex().gap(4).child(picker)
+      .child(div().text_size(11).text_color(t.dim)
+        .child(`Paths and ~ are on ${cur}.`));
   }
 
   row(t, label, control) {
@@ -196,6 +222,7 @@ export class Edit {
     if (this.creating) rows.push(this.row(t, "Name", h_flex().id("f-name").h(34).px(10).items_center().border_1().border_color(t.input).bg(t.background)
       .on_click(() => this.nameInput.focus()).child(Input.new(this.nameInput).flex_1().h_full().text_size(12.5).text_color(t.foreground))));
     rows.push(this.row(t, "Kind", this.segmented(t, "kind")));
+    if (this.machines.length || this.choice.machine) rows.push(this.row(t, "Runs on", this.machinePicker(t)));
     for (const [key, label, , scope] of FIELDS) {
       if (key === "repo" && this.shown("agent")) {
         rows.push(this.row(t, label, this.input(t, key)));
