@@ -64,9 +64,18 @@ The panel follows Orca's automations interface: a home page and a history page.
 27. **One config file** for scripts and agents. Splitting them (gates.json for scripts, automations.yaml for agents) hides the scripts from the panel. The panel and the CLI both write to it, so its format must survive a program rewriting one entry.
 28. **No stale spaces or worktrees as a side effect.** The original problem.
 
+## Runs on another machine
+
+29. **A per-automation `machine`**, one of herdr-core's machines (`hc machine ls`). Unset means this Mac, as before. Scheduling, the overlap guard and history stay on this Mac; only the run executes on the machine.
+30. **Paths and environment are the machine's.** `command`, `cwd`, `repo`, `precheck`, `prompt_file` and worktrees resolve there, `~` being its home. Runs get the machine's own login environment plus the entry's `env`; this Mac's is never sent.
+31. **Scripts on a machine behave like local ones:** output and exit code in the run's record, and a timeout stops the script and everything it started on the machine.
+32. **Agent runs on a machine** open their space on it, and their worktrees, cleanup and stopping happen there.
+33. **An unreachable machine fails the run** with a note saying so. No retries; the next fire tries again.
+34. **The machine is checked and shown.** `check` and `set` refuse a machine hc doesn't know and warn when it's only offline. The machine shows in `list`, `show`, history and the panel.
+
 ## Out of scope
 
-- Remote machines and hosts (Orca has them).
+- Scheduling from another machine. The scheduler always runs on this Mac; running it on the remote itself is the answer for a Mac that sleeps.
 - RRULE schedules and presets; cron only.
 - Token and cost tracking per run (Orca shows it).
 - Herdr TUI `workflow:` and `session:`.

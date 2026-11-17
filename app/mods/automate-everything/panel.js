@@ -285,7 +285,7 @@ export class Panel {
           () => openOverlay(menuSpec(item)))))
       .child(h_flex().pl(36).gap(6).items_center().text_size(11.5)
         .child(div().flex_none().text_color(tone(t, status)).child(status))
-        .child(div().flex_none().text_color(t.dim).child(`· ${item.kind ?? "?"} ·`))
+        .child(div().flex_none().text_color(t.dim).child(`· ${item.kind ?? "?"}${item.machine ? ` on ${item.machine}` : ""} ·`))
         .child(div().flex_1().min_w(0).truncate().text_color(last ? tone(t, last.status) : t.dim).child(lastText)))
       .when(Boolean(item.error), (el) => el.child(div().pl(36).text_size(11.5).text_color(t.blocked).child(item.error)));
   }
@@ -373,7 +373,7 @@ export class Panel {
   // ---- history ----------------------------------------------------------
 
   runRow(t, r) {
-    const bits = [r.trigger, r.kind];
+    const bits = [r.trigger, r.kind, r.machine && `on ${r.machine}`];
     if (r.duration_ms != null) bits.push(duration(r.duration_ms));
     if (r.missed_fires > 1) bits.push(`${r.missed_fires} fires`);
     if (r.caught_up) bits.push(`caught up ${r.caught_up}`);
@@ -429,6 +429,7 @@ export class Panel {
       .child(v_flex().gap(5).children([
         this.field(t, "Status", word(r.status), tone(t, r.status)),
         this.field(t, "Trigger", r.trigger),
+        this.field(t, "Machine", r.machine),
         this.field(t, "Scheduled", r.scheduled_for && new Date(r.scheduled_for).toLocaleString()),
         this.field(t, "Missed", r.missed_fires && `${r.missed_fires} fire(s), from ${new Date(r.first_missed).toLocaleString()}`),
         this.field(t, "Caught up", r.caught_up && `${r.caught_up} earlier fire(s)`),
