@@ -27,16 +27,29 @@ async function call(args) {
 
 const json = async (args) => JSON.parse(await call(args));
 
-export const list = () => json(["list", "--json"]);
-export const history = (limit = 200) => json(["history", "--json", "--limit", String(limit)]);
-export const show = (id) => json(["show", id, "--json"]);
-export const get = (name) => json(["get", name]);
-export const status = () => json(["status", "--json"]);
-export const machines = () => json(["machines", "--json"]);
-export const runNow = (name) => json(["run", name, "--json"]);
-export const pause = (name) => call(["pause", name]);
-export const resume = (name) => call(["resume", name]);
-export const remove = (name) => call(["delete", name, "--yes"]);
-export const move = (name, to) => call(["move", name, "--to", String(to)]);
-export const save = (name, fields, create) =>
-  call(["set", name, "--fields", JSON.stringify(fields), ...(create ? ["--create"] : [])]);
+// `on`: a machine whose own scheduler holds the entry (`--on <machine>`); the
+// CLI answers from there, failing fast when it's offline. null: this Mac.
+const at = (on, args) => (on ? ["--on", on, ...args] : args);
+
+export const list = (on) => json(at(on, ["list", "--json"]));
+export const history = (limit = 200, on) => json(at(on, ["history", "--json", "--limit", String(limit)]));
+export const show = (id, on) => json(at(on, ["show", id, "--json"]));
+export const get = (name, on) => json(at(on, ["get", name]));
+export const status = (on) => json(at(on, ["status", "--json"]));
+// With `probe`, each connected machine says whether it runs automate-everything.
+export const machines = (probe = false) => json(["machines", "--json", ...(probe ? ["--probe"] : [])]);
+export const runNow = (name, on) => json(at(on, ["run", name, "--json"]));
+export const pause = (name, on) => call(at(on, ["pause", name]));
+export const resume = (name, on) => call(at(on, ["resume", name]));
+export const remove = (name, on) => call(at(on, ["delete", name, "--yes"]));
+export const move = (name, to, on) => call(at(on, ["move", name, "--to", String(to)]));
+export const save = (name, fields, create, on) =>
+  call(at(on, ["set", name, "--fields", JSON.stringify(fields), ...(create ? ["--create"] : [])]));
+// Hands the entry from `on` (null: this Mac) to `to` (a machine, or "here").
+export const transfer = (name, to, fields, on) =>
+  call(at(on, ["transfer", name, "--to", to, ...(fields ? ["--fields", JSON.stringify(fields)] : [])]));
+
+// Machines that can schedule entries: running automate-everything new enough
+// for `--on`.
+export const PROTOCOL = 1;
+export const schedulers = (ms) => ms.filter((m) => m.automate_everything?.installed && (m.automate_everything.protocol ?? 0) >= PROTOCOL);

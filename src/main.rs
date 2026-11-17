@@ -594,6 +594,7 @@ fn machines(json_out: bool, probe: bool) -> Result<()> {
                 m["automate_everything"] = ask.join().ok().flatten().unwrap_or(serde_json::Value::Null);
             }
         });
+        remember_machines(&mut v);
     }
     if json_out {
         println!("{}", serde_json::to_string_pretty(&v)?);
@@ -616,6 +617,44 @@ fn machines(json_out: bool, probe: bool) -> Result<()> {
         println!("{}  {}{extra}", m["name"].as_str().unwrap_or(""), m["state"].as_str().unwrap_or(""));
     }
     Ok(())
+}
+
+/// Machines seen running automate-everything, kept in the state folder so
+/// one that's offline now still shows up (`reachable: false`, `seen_at`)
+/// instead of vanishing. One answering without it is forgotten.
+fn remember_machines(v: &mut [serde_json::Value]) {
+    let path = paths::state_dir().join("machines.json");
+    let mut seen: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let before = seen.clone();
+    for m in v.iter_mut() {
+        let name = m["name"].as_str().unwrap_or("").to_string();
+        let ae = &mut m["automate_everything"];
+        if ae["installed"] == true {
+            ae["reachable"] = json!(true);
+            let mut keep = ae.clone();
+            keep["seen_at"] = json!(Utc::now().format("%Y-%m-%dT%H:%M:00Z").to_string());
+            ae["seen_at"] = keep["seen_at"].clone();
+            seen.insert(name, keep);
+        } else if ae["installed"] == false {
+            seen.remove(&name);
+        } else if let Some(last) = seen.get(&name) {
+            // Offline, or it didn't answer: what it ran when last seen.
+            let error = ae["error"].clone();
+            *ae = last.clone();
+            ae["reachable"] = json!(false);
+            ae["scheduler_running"] = serde_json::Value::Null;
+            if !error.is_null() {
+                ae["error"] = error;
+            }
+        }
+    }
+    if seen != before {
+        let _ = paths::ensure_state_dirs();
+        let _ = std::fs::write(&path, serde_json::to_string_pretty(&seen).unwrap_or_default());
+    }
 }
 
 fn status(json_out: bool) -> Result<()> {

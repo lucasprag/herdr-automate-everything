@@ -1,6 +1,11 @@
 // The edit form: one entry's fields. Save sends them to `automate-everything
 // set`, which validates and rewrites only that entry; anything invalid comes
 // back as an error here and nothing is written.
+//
+// An entry runs on this Mac or a machine ("Runs on"); one that runs on a
+// machine can also be scheduled by it ("Scheduled by"), so it fires while this
+// Mac sleeps. Such an entry lives in that machine's config (`--on`), and
+// changing who schedules it is a `transfer`.
 
 import { div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea } from "gpui-base";
@@ -49,7 +54,9 @@ export class Edit {
     this.error = null;
     this.saving = false;
     this.loaded = this.creating;
-    this.choice = { kind: "script", directory: "repo", space: "per-run", machine: null };
+    // scheduler: the machine whose scheduler holds it; null for this Mac.
+    this.from = p.on ?? null;
+    this.choice = { kind: "script", directory: "repo", space: "per-run", machine: null, scheduler: this.from };
     // hc's machines, for the picker; [] until known (or when hc has none).
     this.machines = [];
     this.handle = cx.focus_handle();
@@ -66,7 +73,7 @@ export class Edit {
     }
     cx.spawn(async (cx) => {
       try {
-        this.machines = await cli.machines();
+        this.machines = await cli.machines(true);
       } catch {}
       cx.notify();
     });
@@ -76,14 +83,15 @@ export class Edit {
     }
     cx.spawn(async (cx) => {
       try {
-        const entry = await cli.get(p.name);
+        const entry = await cli.get(p.name, this.from);
         this.choice.kind = entry.kind ?? "script";
         this.choice.directory = entry.directory ?? "repo";
         this.choice.space = entry.space ?? "per-run";
-        this.choice.machine = entry.machine ?? null;
+        // On its machine's side an entry it runs itself has no `machine`.
+        this.choice.machine = entry.machine ?? this.from;
         for (const [key] of FIELDS) this.inputs[key].set_value(toText(key, entry[key]));
         // What the form shows now, so Save sends only what changed.
-        try { this.original = this.fields(); } catch { this.original = {}; }
+        try { this.original = this.fields(this.from); } catch { this.original = {}; }
         this.loaded = true;
       } catch (e) {
         this.error = String(e?.message ?? e);
@@ -101,9 +109,11 @@ export class Edit {
   }
 
   // The fields to send: every field, null where empty or not for this kind,
-  // so `set` removes what was cleared.
-  fields() {
-    const out = { kind: this.choice.kind, machine: this.choice.machine ?? null };
+  // so `set` removes what was cleared. `machine` is as `scheduler` sees it:
+  // none when it runs on the machine that schedules it.
+  fields(scheduler = this.choice.scheduler) {
+    const m = this.choice.machine ?? null;
+    const out = { kind: this.choice.kind, machine: m === scheduler ? null : m };
     const agent = this.choice.kind === "agent";
     out.directory = agent && this.choice.directory === "worktree" ? "worktree" : null;
     out.space = agent && this.choice.space === "shared" ? "shared" : null;
@@ -135,18 +145,31 @@ export class Edit {
     return out;
   }
 
+  // This Mac's zone, written into an entry another machine schedules when
+  // it has none: an empty timezone means the scheduler's own.
+  async localZone() {
+    try {
+      const tz = (await cli.status()).timezone;
+      if (tz) return tz;
+    } catch {}
+    return Intl.DateTimeFormat().resolvedOptions().timeZone;
+  }
+
   save(cx) {
     if (this.saving || !this.loaded) return;
+    const to = this.choice.scheduler ?? null;
+    const moving = !this.creating && to !== this.from;
     let name, fields;
     try {
       name = this.creating ? this.nameInput.value().trim() : props().name;
       if (!name) throw new Error("Give it a name");
-      fields = this.fields();
+      // Changes are sent as the entry's current scheduler sees them.
+      fields = this.fields(this.creating ? to : this.from);
       if (this.original) {
         for (const k of Object.keys(fields)) {
           if (JSON.stringify(fields[k]) === JSON.stringify(this.original[k])) delete fields[k];
         }
-        if (!Object.keys(fields).length) return this.close();
+        if (!Object.keys(fields).length && !moving) return this.close();
       }
     } catch (e) {
       this.error = String(e?.message ?? e);
@@ -158,7 +181,18 @@ export class Edit {
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        await cli.save(name, fields, this.creating);
+        if (this.creating) {
+          if (to && !fields.timezone) fields.timezone = await this.localZone();
+          await cli.save(name, fields, true, to);
+        } else if (!moving) {
+          await cli.save(name, fields, false, this.from);
+        } else {
+          // Back here from a machine, an entry runs there unless Runs on says otherwise.
+          const runsOn = this.choice.machine ?? null;
+          if (!to) delete fields.machine;
+          await cli.transfer(name, to ?? "here", Object.keys(fields).length ? fields : null, this.from);
+          if (!to && runsOn !== this.from) await cli.save(name, { machine: runsOn }, false, null);
+        }
         this.close();
       } catch (e) {
         this.error = String(e?.message ?? e);
@@ -176,7 +210,12 @@ export class Edit {
         .border_1().border_color(on ? t.accent : t.input).bg(on ? t.selected : t.background)
         .text_size(12).text_color(on ? t.foreground : t.muted)
         .hover((s) => s.text_color(t.foreground))
-        .on_click((_e, cx) => { this.choice[key] = value; cx.notify(); })
+        .on_click((_e, cx) => {
+          this.choice[key] = value;
+          // Only the machine it runs on can schedule it.
+          if (key === "machine" && this.choice.scheduler && this.choice.scheduler !== value) this.choice.scheduler = null;
+          cx.notify();
+        })
         .child(label);
     }));
   }
@@ -195,6 +234,23 @@ export class Edit {
     return v_flex().gap(4).child(picker)
       .child(div().text_size(11).text_color(t.dim)
         .child(`Paths and ~ are on ${cur}.`));
+  }
+
+  // Whether `machine` can keep the schedule itself: it runs a new enough
+  // automate-everything (or already holds this entry).
+  canSchedule(machine) {
+    if (!machine) return false;
+    if (machine === this.from) return true;
+    return cli.schedulers(this.machines).some((m) => m.name === machine && m.automate_everything.reachable !== false);
+  }
+
+  schedulerPicker(t) {
+    const m = this.choice.machine;
+    const picker = this.segmented(t, "scheduler", [[null, "This Mac · needs it awake"], [m, `${m} · runs while this Mac sleeps`]]);
+    const note = this.choice.scheduler
+      ? `${m}'s own scheduler fires it, even with this Mac asleep or off. Its runs and history stay on ${m}.`
+      : `This Mac fires it and waits for it: nothing runs while this Mac sleeps.`;
+    return v_flex().gap(4).child(picker).child(div().text_size(11).text_color(t.dim).child(note));
   }
 
   row(t, label, control) {
@@ -223,6 +279,7 @@ export class Edit {
       .on_click(() => this.nameInput.focus()).child(Input.new(this.nameInput).flex_1().h_full().text_size(12.5).text_color(t.foreground))));
     rows.push(this.row(t, "Kind", this.segmented(t, "kind")));
     if (this.machines.length || this.choice.machine) rows.push(this.row(t, "Runs on", this.machinePicker(t)));
+    if (this.canSchedule(this.choice.machine)) rows.push(this.row(t, "Scheduled by", this.schedulerPicker(t)));
     for (const [key, label, , scope] of FIELDS) {
       if (key === "repo" && this.shown("agent")) {
         rows.push(this.row(t, label, this.input(t, key)));
@@ -246,7 +303,7 @@ export class Edit {
         cx.stop_propagation();
       })
       .child(h_flex().px(18).pt(16).pb(10).items_center()
-        .child(div().flex_1().text_size(15).font_semibold().text_color(t.foreground).child(this.creating ? "New automation" : `Edit ${p.name}`))
+        .child(div().flex_1().text_size(15).font_semibold().text_color(t.foreground).child(this.creating ? "New automation" : this.from ? `Edit ${p.name} on ${this.from}` : `Edit ${p.name}`))
         .child(div().text_size(11).text_color(t.dim).child("Cmd+Enter: save · Esc")))
       .child(v_flex().id("ae-edit-fields").flex_1().min_h(0).overflow_y_scrollbar().px(18).pb(12).gap(12)
         .children(this.loaded ? rows : [div().text_color(t.dim).child(this.error ? "" : "Loading…")]))
