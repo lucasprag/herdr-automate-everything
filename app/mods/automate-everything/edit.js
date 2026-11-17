@@ -9,8 +9,8 @@
 // An automation a machine defines itself is edited there (`--on`), without
 // "Runs on".
 
-import { div } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, TextareaState, Textarea } from "gpui-base";
+import { div, svg } from "gpui-kit";
+import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, Checkbox } from "gpui-base";
 import { theme, props, closeOverlay, settings, run } from "herdr";
 import * as cli from "./cli.js";
 
@@ -35,6 +35,8 @@ const FIELDS = [
   ["timeout_seconds", "Run timeout (s)", "Default 3600 for scripts, 10800 for agents", "all", "int"],
   ["env", "Environment", "KEY=value, one per line (optional)", "all", "env"],
 ];
+
+const CHROME = "mods/workspace-chrome";
 
 const CHOICES = {
   kind: [["script", "Script"], ["agent", "Agent"]],
@@ -231,7 +233,7 @@ export class Edit {
     }
     if (c.via) {
       c.via = null;
-      c.places = place === "local" ? ["local"] : [place];
+      c.places = place === "local" ? ["local"] : ["local", place];
       return;
     }
     const next = c.places.includes(place) ? c.places.filter((p) => p !== place) : [...c.places, place];
@@ -241,39 +243,43 @@ export class Edit {
     c.places = next.sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99));
   }
 
-  // "This Mac", then each hc machine (with its state when not connected),
-  // plus any the entry names that hc doesn't list (any more).
+  // A checkbox per place: "This Mac", then each hc machine (with its state
+  // when not connected), plus any the entry names that hc doesn't list (any
+  // more). Each says what ticking it means.
   placePicker(t) {
     const c = this.choice;
     const names = this.machines.map((m) => m.name);
     for (const p of [...c.places, c.via]) if (p && p !== "local" && !names.includes(p)) names.push(p);
-    const options = [["local", "This Mac"], ...names.map((n) => {
+    const ticked = (p) => (c.via ? p === c.via || p === "local" : c.places.includes(p));
+    const rows = [["local", "This Mac", "This Mac's scheduler fires it, only while this Mac is awake."]];
+    for (const n of names) {
       const m = this.machines.find((x) => x.name === n);
-      const state = !m ? "unknown" : m.state !== "connected" ? m.state : null;
-      return [n, state ? `${n} (${state})` : n];
-    })];
-    const on = (p) => (c.via ? p === c.via : c.places.includes(p));
-    const chips = h_flex().gap(0).children(options.map(([value, label]) => h_flex().id(`place-${value}`).h(30).px(12)
-      .items_center().cursor_pointer()
-      .border_1().border_color(on(value) ? t.accent : t.input).bg(on(value) ? t.selected : t.background)
-      .text_size(12).text_color(on(value) ? t.foreground : t.muted)
-      .hover((s) => s.text_color(t.foreground))
-      .on_click((_e, cx) => { this.toggle(value); cx.notify(); })
-      .child(label)));
-    const machines = c.places.filter((p) => p !== "local");
-    const note = c.via
-      ? `This Mac fires it and runs it on ${c.via} through hc (${c.via} has no automate-everything): nothing runs while this Mac sleeps. Paths and ~ are on ${c.via}.`
-      : machines.length
-        ? (() => {
-          const many = machines.length > 1;
-          const who = `${machines.join(" and ")} ${many ? "each fire" : "fires"}`;
-          const what = c.places.includes("local")
-            ? `This Mac fires it, and ${who} ${many ? "their" : "its"} own copy`
-            : `${who} it with ${many ? "their" : "its"} own scheduler`;
-          return `${what}, even while this Mac sleeps. Paths and ~ are on the machine it runs on.`;
-        })()
-        : null;
-    return note ? v_flex().gap(4).child(chips).child(div().text_size(11).text_color(t.dim).child(note)) : chips;
+      const state = !m ? "unknown to hc" : m.state !== "connected" ? m.state : null;
+      const hint = this.capable(n)
+        ? `${n} fires its own copy, even while this Mac sleeps.`
+        : `No automate-everything on ${n}: this Mac runs it there through hc, only while this Mac is awake. Can't be combined with another machine.`;
+      rows.push([n, state ? `${n} (${state})` : n, hint]);
+    }
+    const box = (on) => div().size(14).mt(1).flex_none().flex().items_center().justify_center()
+      .border_1().border_color(on ? t.accent : t.input).bg(on ? t.accent : t.background)
+      .when(on, (el) => el.child(svg(`${CHROME}/check.svg`).size(11).text_color(t.solid_foreground)));
+    const list = v_flex().gap(6).children(rows.map(([value, label, hint]) => {
+      const on = ticked(value);
+      // Through hc, This Mac fires it: shown ticked, but not something to untick on its own.
+      const locked = value === "local" && Boolean(c.via);
+      return Checkbox.new(`place-${value}`).checked(on)
+        .on_change((_v, cx) => { if (!locked) { this.toggle(value); cx.notify(); } })
+        .h_flex().gap(8).items_start().cursor_pointer()
+        .when(locked, (el) => el.opacity(0.6))
+        .child(box(on))
+        .child(v_flex().gap(1).min_w(0)
+          .child(div().text_size(12.5).text_color(t.foreground).child(label))
+          .child(div().text_size(11).text_color(t.dim).child(hint)));
+    }));
+    const elsewhere = c.via || c.places.some((p) => p !== "local");
+    return elsewhere
+      ? v_flex().gap(8).child(list).child(div().text_size(11).text_color(t.dim).child("Paths and ~ are on the machine it runs on."))
+      : list;
   }
 
   row(t, label, control) {
