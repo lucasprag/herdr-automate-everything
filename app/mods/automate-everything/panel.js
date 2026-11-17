@@ -12,6 +12,9 @@ const REFRESH_MS = 15000;
 // this Mac's refresh. Which machines run automate-everything: rarer still.
 const REMOTE_MS = 60000;
 const DISCOVER_MS = 5 * 60 * 1000;
+// While a machine has something running: there are no files here to watch for
+// its end, so it's asked this often until nothing is.
+const RUNNING_MS = 5000;
 const INSTALL_MS = 5 * 60 * 1000;
 const MOD_DIR = `${appHome()}/mods/automate-everything`;
 const OUTPUT_LINES = 400;
@@ -195,6 +198,14 @@ export class Panel {
         }
       } while (r.again);
       r.busy = false;
+      // Something running there: look again soon, so its end shows when it happens.
+      if (!r.soon && r.items?.some((i) => i.status === "running")) {
+        r.soon = true;
+        cx.timer.after(RUNNING_MS, (cx) => {
+          r.soon = false;
+          this.refreshRemote(name, cx);
+        });
+      }
       cx.notify();
     });
   }
