@@ -9,7 +9,7 @@
 
 import { div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea } from "gpui-base";
-import { theme, props, closeOverlay, settings } from "herdr";
+import { theme, props, closeOverlay, settings, run } from "herdr";
 import * as cli from "./cli.js";
 
 // [key, label, placeholder, kind ("all" | "script" | "agent"), type]
@@ -193,6 +193,8 @@ export class Edit {
           await cli.transfer(name, to ?? "here", Object.keys(fields).length ? fields : null, this.from);
           if (!to && runsOn !== this.from) await cli.save(name, { machine: runsOn }, false, null);
         }
+        // The panel only hears about this Mac's files; tell it about another machine's.
+        for (const m of new Set([this.from, to])) if (m) run(`automate-everything.refresh:${m}`);
         this.close();
       } catch (e) {
         this.error = String(e?.message ?? e);

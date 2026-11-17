@@ -58,6 +58,8 @@ export class Panel {
         else if (name === "new") openOverlay(editSpec(null));
         else if (name === "edit" && arg) openOverlay(editSpec(arg, on));
         else if (name === "run" && arg) this.openRun(arg, cx, on);
+        // From the popups and the form after a change: `refresh:<machine>`, or this Mac's list.
+        else if (name === "refresh") arg ? this.refreshRemote(arg, cx) : this.refresh(cx);
         else if (name === "menu" && arg) {
           const item = this.allItems().find((i) => i.name === arg && (i.on ?? null) === on);
           if (item) openOverlay(menuSpec(item));
@@ -362,7 +364,8 @@ export class Panel {
     const lastText = last ? `${word(last.status)} ${ago(when(last))}` : "never ran";
     const next = item.next && status !== "paused" ? `next ${clock(item.next)}` : "";
     const dragged = Boolean(!on && this.drag?.moved && this.drag.name === item.name);
-    const where = on ? ` · by ${on}` : item.machine ? ` on ${item.machine}` : "";
+    const where = on ? ` · scheduled by ${on}` : item.machine ? ` on ${item.machine}` : "";
+    const others = item.status === "invalid" ? [] : (this.twins().get(item.name) ?? []).filter((w) => w !== (on ?? "this Mac"));
     return v_flex().id(`ae-item-${key}`).pl(6).pr(16).py(8).gap(3).flex_none()
       .when(offline, (el) => el.opacity(0.55))
       // Mid-drag the list's grabbing cursor shows over every line.
@@ -396,36 +399,33 @@ export class Panel {
         .child(div().flex_none().text_color(tone(t, status)).child(status))
         .child(div().flex_none().text_color(t.dim).child(`· ${item.kind ?? "?"}${where} ·`))
         .child(div().flex_1().min_w(0).truncate().text_color(last ? tone(t, last.status) : t.dim).child(lastText)))
-      .when(Boolean(item.error), (el) => el.child(div().pl(36).text_size(11.5).text_color(t.blocked).child(item.error)));
+      .when(Boolean(item.error), (el) => el.child(div().pl(36).text_size(11.5).text_color(t.blocked).child(item.error)))
+      .when(others.length > 0, (el) => el.child(div().pl(36).text_size(11.5).text_color(t.blocked)
+        .child(`Also scheduled by ${others.join(", ")}: it fires from each. Delete the one you don't want.`)));
   }
 
-  // The heading over the entries a machine schedules itself, with its state.
-  remoteHeader(t, name, r) {
-    const note = r.outdated
-      ? `automate-everything ${r.version ?? "?"} there is too old: update it`
-      : r.reachable === false
-        ? `unreachable${r.at || r.seenAt ? ` · last seen ${ago(r.at ?? r.seenAt)}` : ""}`
-        : r.status && !r.status.scheduler_running ? "its scheduler isn't running" : null;
-    return v_flex().id(`ae-remote-${name}`).px(14).pt(12).pb(6).gap(2).flex_none().border_b(1).border_color(t.border)
-      .child(h_flex().gap(6).items_center().text_size(11.5)
-        .child(div().font_medium().text_color(t.muted).child(`Scheduled by ${name}`))
-        .child(div().text_color(t.dim).child("· runs while this Mac sleeps")))
-      .when(Boolean(note), (el) => el.child(div().text_size(11.5).text_color(r.reachable === false || r.outdated ? t.blocked : t.dim)
-        .tooltip(r.error ?? "").child(note)));
-  }
-
-  remoteGroups(t) {
+  // A line about a machine whose entries are in the list, only when
+  // something's wrong with it: they're shown as last known meanwhile.
+  remoteNotices(t) {
     const out = [];
     for (const [name, r] of this.remotes) {
-      out.push(this.remoteHeader(t, name, r));
-      if (r.items === null && !r.outdated && r.reachable !== false) {
-        out.push(div().px(14).py(8).text_size(12).text_color(t.dim).child("Loading…"));
-      } else if (r.items && !r.items.length) {
-        out.push(div().px(16).py(8).text_size(12).text_color(t.dim).child(`Nothing scheduled by ${name}.`));
-      }
-      out.push(...(r.items ?? []).map((i) => this.itemRow(t, i)));
+      const note = r.outdated
+        ? `${name}: automate-everything ${r.version ?? "?"} there is too old to manage from here; update it`
+        : r.reachable === false
+          ? `${name} is unreachable${r.at || r.seenAt ? ` (last seen ${ago(r.at ?? r.seenAt)})` : ""}: its automations show as last known`
+          : r.status && !r.status.scheduler_running ? `${name}'s scheduler isn't running` : null;
+      if (note) out.push(div().id(`ae-remote-${name}`).px(14).py(7).flex_none().text_size(11.5).text_color(t.blocked)
+        .border_b(1).border_color(t.border).tooltip(r.error ?? "").child(note));
     }
     return out;
+  }
+
+  // Names in more than one scheduler's config: each one fires.
+  twins() {
+    const seen = new Map();
+    // An invalid entry never fires, so it doesn't count.
+    for (const i of this.allItems().filter((i) => i.status !== "invalid")) seen.set(i.name, [...(seen.get(i.name) ?? []), i.on ?? "this Mac"]);
+    return seen;
   }
 
   home(t) {
@@ -446,8 +446,10 @@ export class Panel {
           cx.notify();
         }
       })
+      // One list: this Mac's entries (reorderable), then those other machines schedule.
+      .children(this.remoteNotices(t))
       .children(this.ordered().map((i) => this.itemRow(t, i)))
-      .children(this.remoteGroups(t));
+      .children([...this.remotes.values()].flatMap((r) => (r.items ?? []).map((i) => this.itemRow(t, i))));
   }
 
   // ---- dragging to reorder ---------------------------------------------

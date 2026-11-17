@@ -105,11 +105,11 @@ automate-everything --on lab run hello
 automate-everything --on lab history hello
 ```
 
-Its entries show in the panel in their own group, "Scheduled by lab", with
-run now, pause, resume, edit, delete and history working as for this Mac's.
-They keep running while the Mac sleeps or is off. If the machine can't be
-reached the group says so, with when it was last seen, and its buttons do
-nothing until it's back. See [Scheduled by another machine](#scheduled-by-another-machine).
+Its entries show in the panel's list after this Mac's, marked "scheduled by
+lab", with run now, pause, resume, edit, delete and history working as for
+this Mac's. They keep running while the Mac sleeps or is off. If the machine
+can't be reached, a line at the top says so (with when it was last seen), its
+entries show as last known and their buttons do nothing until it's back. See [Scheduled by another machine](#scheduled-by-another-machine).
 
 ## What's in this repo
 
@@ -180,9 +180,11 @@ To change the order, drag an automation up or down by the dotted handle on its l
 
 **Scheduled by another machine:** an automation that runs on a machine running
 automate-everything itself can be scheduled by that machine instead (**Scheduled
-by** in the edit form), so it fires while this Mac sleeps. Those show below this
-Mac's, in a group per machine, refreshed every minute. A machine that can't be
-reached is marked as such and its buttons do nothing until it's back.
+by** in the edit form), so it fires while this Mac sleeps. They're in the same list, after this Mac's, marked "scheduled by
+<machine>", and refreshed every minute and right after you change one. A
+machine that can't be reached gets a line at the top, and its entries' buttons
+do nothing until it's back. A name scheduled by both this Mac and a machine
+fires from each, so the panel flags it: delete the one you don't want.
 
 **History** lists every run, other machines' included. Click one to see what happened: when it ran, how
 long it took, its output and, for an agent, what was on its screen at the end.

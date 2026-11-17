@@ -48,6 +48,8 @@ export class Confirm {
     cx.spawn(async (cx) => {
       try {
         await cli.remove(props().name, props().on ?? null);
+        // The panel only hears about this Mac's files; tell it about another machine's.
+        if (props().on) run(`automate-everything.refresh:${props().on}`);
         closeOverlay(props().overlay);
       } catch (e) {
         this.error = String(e?.message ?? e);
