@@ -38,6 +38,7 @@ What a run's status means:
 - **Worktree runs** (`directory = "worktree"`) get a fresh worktree that is removed once the space closes. A branch with unpushed commits is kept, but the prompt should end in a push or a PR if the work matters.
 - **Frequent agent schedules** (hourly or more often) should use `space = "shared"`, so runs open as tabs in one space instead of filling the sidebar.
 - **A new entry goes live at its next matching minute.** Past fires never run, so there's no backfill. Prove the entry first with `run <name> --wait`: it runs even while paused and skips the precheck. For an agent, `--wait` lasts as long as the agent does, so use a plain `run` and follow it with `history`.
+- **Running on another machine:** `machine = "<name>"` (one of `automate-everything machines`) runs the entry on that herdr-core machine while this Mac keeps scheduling it. `command`, `cwd`, `repo`, `precheck` and `prompt_file` are paths on that machine (`~` is its home), so check them there (`hc exec --on <name> ls <path>`), not here. An unreachable machine fails the run with a note; `check` reports unknown machines and missing paths.
 - **Fanning out from an agent run:** `automate-everything tab open` (see `--help`) starts a helper as another tab in the run's space (`--space <id>` for another space, `--new-space <name>` for a new one), and `tab close --self` is the helper's last command. When the run succeeds, the runner closes only the run's own tab; the space closes once its last tab does.
 
 ## Pausing, resuming, deleting

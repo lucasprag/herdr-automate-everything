@@ -143,9 +143,9 @@ fn open(
         v.extend(argv);
         v
     };
-    let terminal = hc::launch(&hc::Launch { cwd: &cwd, labels, argv: full })?;
+    let terminal = hc::launch(&hc::Launch { on: None, cwd: &cwd, labels, argv: full, keep: true })?;
     let named = match &new_space {
-        Some(space_name) => hc::name_space_and_tab(&space, space_name, &cwd, &tab, name, &terminal),
+        Some(space_name) => hc::name_space_and_tab(None, &space, space_name, &cwd, &tab, name, &terminal),
         None => hc::name_tab(&space, &tab, name, &terminal),
     }
     .err()
@@ -269,6 +269,6 @@ fn forget_if_empty(t: &Value) {
     std::thread::sleep(Duration::from_millis(500));
     let Ok(left) = hc::live_with_labels(&[("herdr.tab", &tab)]) else { return };
     if left.is_empty() {
-        let _ = hc::forget_tab(&space, &tab);
+        let _ = hc::forget_tab(None, &space, &tab);
     }
 }

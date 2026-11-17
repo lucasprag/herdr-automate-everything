@@ -14,8 +14,9 @@ use serde_json::Value;
 
 use crate::config::{Automation, Directory, SpaceMode};
 use crate::history::{self, AgentInfo, Run, Status, StepResult, Trigger};
-use crate::runner::{run_env, shell_command};
-use crate::{hc, paths, proc};
+use crate::host::Host;
+use crate::runner::{run_env, run_labels, run_vars, shell_command};
+use crate::{hc, proc};
 
 const POLL: Duration = Duration::from_secs(3);
 /// How long an agent has to take its prompt.
@@ -27,15 +28,27 @@ const OUTPUT_LINES: usize = 5000;
 const PRECHECK_KEEP: usize = 64 * 1024;
 pub const RUN_LABEL: &str = "automation.run";
 
-pub fn run(a: &Automation, run: &mut Run) -> Result<()> {
-    let env = run_env(a, run);
-    let repo = a.repo().ok_or_else(|| anyhow!("no repo"))?;
+pub fn run(a: &Automation, host: &Host, run: &mut Run) -> Result<()> {
+    let repo = a.repo(host).ok_or_else(|| anyhow!("no repo"))?;
+    let on = host.machine();
 
     // 1. Precheck: exit 0 starts the run; anything else skips it.
     if run.trigger == Trigger::Scheduled {
         if let Some(pc) = a.entry.precheck.clone().filter(|p| !p.trim().is_empty()) {
-            let cmd = shell_command(&pc, &repo, &env);
-            let res = proc::output_with_timeout(cmd, Duration::from_secs(a.precheck_timeout_seconds()));
+            let timeout = Duration::from_secs(a.precheck_timeout_seconds());
+            // A machine that drops mid-precheck fails the run (after recording
+            // what the precheck got to), rather than reading as a skip.
+            let mut lost = None;
+            let res = match host {
+                Host::Local => proc::output_with_timeout(shell_command(&pc, &repo, &run_env(a, run)), timeout)
+                    .map_err(anyhow::Error::from),
+                Host::Remote(r) => {
+                    let key = format!("{}-precheck", run.id);
+                    let r = r.run_command(&key, &repo, &pc, &run_vars(a, run), timeout, &run_labels(a, run))?;
+                    lost = r.error;
+                    Ok(r.out)
+                }
+            };
             let step = match res {
                 Ok(o) => StepResult {
                     command: pc.clone(),
@@ -53,11 +66,14 @@ pub fn run(a: &Automation, run: &mut Run) -> Result<()> {
                     timed_out: false,
                     duration_ms: 0,
                     stdout: String::new(),
-                    stderr: format!("could not start: {e}"),
+                    stderr: format!("could not start: {e:#}"),
                 },
             };
             let passed = step.exit_code == Some(0) && !step.timed_out;
             run.precheck = Some(step);
+            if let Some(e) = lost {
+                bail!("precheck: {e}");
+            }
             if !passed {
                 run.finish(Status::SkippedPrecheck);
                 return Ok(());
@@ -76,7 +92,7 @@ pub fn run(a: &Automation, run: &mut Run) -> Result<()> {
     // 2. Directory.
     if a.directory() == Directory::Worktree {
         info.base_branch = Some(a.base_branch());
-        let wt = create_worktree(a, &repo, &env).context("creating the worktree")?;
+        let wt = create_worktree(a, host, &repo).context("creating the worktree")?;
         info.cwd = wt.path.display().to_string();
         info.worktree = Some(wt.path.display().to_string());
         info.branch = Some(wt.branch);
@@ -85,13 +101,13 @@ pub fn run(a: &Automation, run: &mut Run) -> Result<()> {
         run.save()?;
     }
 
-    let prompt = a.prompt_text()?;
+    let prompt = a.prompt_text(host)?;
 
     // 3. Space.
     let space_name = a.space_name();
     let (space_id, created) = match a.space_mode() {
         SpaceMode::PerRun => (hc::new_id("sp"), true),
-        SpaceMode::Shared => match hc::find_space_by_name(&space_name)? {
+        SpaceMode::Shared => match hc::find_space_by_name(on, &space_name)? {
             Some(id) => (id, false),
             None => (hc::new_id("sp"), true),
         },
@@ -104,12 +120,11 @@ pub fn run(a: &Automation, run: &mut Run) -> Result<()> {
 
     // 4. Launch, inside a login shell that stays when the agent ends, as the
     //    app starts agents: the space stays readable after a failure.
-    let shell = crate::env::shell_of(&env);
+    // An entry's `env.SHELL` picks the shell, as it always has; else the
+    // login shell of the machine it runs on.
+    let vars = run_vars(a, run);
+    let shell = vars.get("SHELL").filter(|s| !s.is_empty()).cloned().unwrap_or_else(|| host.shell());
     let mut argv = vec!["/usr/bin/env".to_string()];
-    let mut vars = a.env();
-    vars.insert("HERDR_AUTOMATION".into(), a.name.clone());
-    vars.insert("HERDR_AUTOMATION_RUN_ID".into(), run.id.clone());
-    vars.insert("HERDR_AUTOMATION_TRIGGER".into(), run.trigger.as_str().into());
     argv.extend(vars.iter().map(|(k, v)| format!("{k}={v}")));
     argv.extend([shell.clone(), "-lic".into(), "\"$@\"; exec \"$0\" -li".into(), shell]);
     argv.push(a.agent().to_string());
@@ -121,6 +136,8 @@ pub fn run(a: &Automation, run: &mut Run) -> Result<()> {
     argv.push(prompt);
 
     let terminal = hc::launch(&hc::Launch {
+        on,
+        keep: true,
         cwd: &info.cwd,
         labels: vec![
             ("herdr.space".into(), space_id.clone()),
@@ -134,12 +151,12 @@ pub fn run(a: &Automation, run: &mut Run) -> Result<()> {
     run.agent = Some(info.clone());
     run.save()?;
 
-    if let Err(e) = hc::name_space_and_tab(&space_id, &space_name, &info.cwd, &tab_id, &a.name, &terminal) {
+    if let Err(e) = hc::name_space_and_tab(on, &space_id, &space_name, &info.cwd, &tab_id, &a.name, &terminal) {
         run.note = Some(format!("could not name the space: {e:#}"));
     }
 
     // 5. Watch it.
-    let result = watch(a, run, &mut info, &terminal);
+    let result = watch(a, host, run, &mut info, &terminal);
     run.agent = Some(info.clone());
     result
 }
@@ -182,7 +199,7 @@ fn add_note(run: &mut Run, note: &str) {
     });
 }
 
-fn watch(a: &Automation, run: &mut Run, info: &mut AgentInfo, terminal: &str) -> Result<()> {
+fn watch(a: &Automation, host: &Host, run: &mut Run, info: &mut AgentInfo, terminal: &str) -> Result<()> {
     let program = basename(a.agent()).to_string();
     let started = Instant::now();
     let timeout = Duration::from_secs(a.timeout_seconds());
@@ -225,7 +242,7 @@ fn watch(a: &Automation, run: &mut Run, info: &mut AgentInfo, terminal: &str) ->
             capture(run, info, terminal);
             info.closed = Some("closed by hand".into());
             add_note(run, "its space or tab was closed by hand");
-            cleanup_after_close(info);
+            cleanup_after_close(host, info);
             run.finish(Status::Closed);
             return Ok(());
         }
@@ -270,7 +287,7 @@ fn watch(a: &Automation, run: &mut Run, info: &mut AgentInfo, terminal: &str) ->
                     run,
                     if seen_alive && !alive { "the agent exited before taking the prompt" } else { "the agent never took the prompt" },
                 );
-                close_ours(info, &run.id);
+                close_ours(host, info, &run.id);
                 run.finish(Status::Failed);
                 return Ok(());
             }
@@ -291,7 +308,7 @@ fn watch(a: &Automation, run: &mut Run, info: &mut AgentInfo, terminal: &str) ->
                 if info.was_blocked {
                     add_note(run, "you stepped in while it was blocked, so its space stays open");
                 } else {
-                    close_ours(info, &run.id);
+                    close_ours(host, info, &run.id);
                 }
                 run.finish(Status::Succeeded);
                 return Ok(());
@@ -301,7 +318,7 @@ fn watch(a: &Automation, run: &mut Run, info: &mut AgentInfo, terminal: &str) ->
         }
 
         if !info.was_blocked && started.elapsed() > timeout {
-            stop_agent(&t, terminal, &program);
+            stop_agent(host, &t, terminal, &program);
             capture(run, info, terminal);
             run.timed_out = true;
             add_note(run, &format!("stopped after the {} timeout; its space stays open", human_secs(a.timeout_seconds())));
@@ -337,11 +354,9 @@ fn answer_trust_question(run: &mut Run, info: &AgentInfo, terminal: &str) -> boo
 }
 
 /// Stops the agent but not its shell, so the space keeps what it showed.
-fn stop_agent(t: &Value, terminal: &str, program: &str) {
+fn stop_agent(host: &Host, t: &Value, terminal: &str, program: &str) {
     let Some(pid) = t["foreground"]["pid"].as_i64() else { return };
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
+    host.signal(pid, libc::SIGTERM);
     for _ in 0..10 {
         std::thread::sleep(Duration::from_secs(1));
         let still = hc::get(terminal)
@@ -353,9 +368,7 @@ fn stop_agent(t: &Value, terminal: &str, program: &str) {
             return;
         }
     }
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
+    host.signal(pid, libc::SIGKILL);
 }
 
 fn addresses(list: &[Value]) -> Vec<String> {
@@ -367,7 +380,7 @@ fn addresses(list: &[Value]) -> Vec<String> {
 /// Closes what this run opened and nothing else: its space if it made the
 /// space and every terminal there is this run's; else only its tab, if every
 /// terminal in the tab is this run's.
-fn close_ours(info: &mut AgentInfo, run_id: &str) {
+fn close_ours(host: &Host, info: &mut AgentInfo, run_id: &str) {
     let (Some(space), Some(tab)) = (info.space_id.clone(), info.tab_id.clone()) else { return };
     let ours = |label: &str, id: &str| -> Option<Vec<String>> {
         let all = hc::live_with_labels(&[(label, id)]).ok()?;
@@ -392,14 +405,14 @@ fn close_ours(info: &mut AgentInfo, run_id: &str) {
     }
     // The app drops ended terminals' tabs itself; when it isn't running, we do.
     std::thread::sleep(Duration::from_secs(2));
-    let _ = hc::forget_tab(&space, &tab);
+    let _ = hc::forget_tab(host.machine(), &space, &tab);
     info.closed = Some(what.into());
-    cleanup_after_close(info);
+    cleanup_after_close(host, info);
 }
 
-fn cleanup_after_close(info: &mut AgentInfo) {
+fn cleanup_after_close(host: &Host, info: &mut AgentInfo) {
     if info.worktree.is_some() && info.worktree_cleanup.is_none() {
-        info.worktree_cleanup = Some(cleanup_worktree(info));
+        info.worktree_cleanup = Some(cleanup_worktree(host, info));
     }
 }
 
@@ -409,73 +422,54 @@ struct Worktree {
     base_commit: String,
 }
 
-fn git(repo: &Path, args: &[&str], timeout: u64) -> Result<String> {
-    let env = crate::env::login_env();
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C").arg(repo).args(args).env_clear().envs(&env).stdin(std::process::Stdio::null());
-    let out = proc::output_with_timeout(cmd, Duration::from_secs(timeout))?;
-    if out.timed_out {
-        bail!("git {} timed out", args.join(" "));
-    }
-    if out.exit_code != Some(0) {
-        bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-fn create_worktree(a: &Automation, repo: &Path, _env: &std::collections::BTreeMap<String, String>) -> Result<Worktree> {
+fn create_worktree(a: &Automation, host: &Host, repo: &Path) -> Result<Worktree> {
     let base = a.base_branch();
     if let Some((remote, branch)) = base.split_once('/') {
-        let remotes = git(repo, &["remote"], 30).unwrap_or_default();
+        let remotes = host.git(repo, &["remote"], 30).unwrap_or_default();
         if remotes.lines().any(|r| r == remote) {
-            git(repo, &["fetch", remote, branch], 180).context("fetching the base branch")?;
+            host.git(repo, &["fetch", remote, branch], 180).context("fetching the base branch")?;
         }
     }
-    let base_commit = git(repo, &["rev-parse", "--verify", &format!("{base}^{{commit}}")], 30)?;
+    let base_commit = host.git(repo, &["rev-parse", "--verify", &format!("{base}^{{commit}}")], 30)?;
     let branch = format!("automation/{}/{}", a.name, Utc::now().format("%Y%m%d-%H%M%S"));
     let repo_name = repo.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "repo".into());
-    let path = paths::home().join(".herdr/worktrees").join(repo_name).join(&branch);
+    let path = host.home().join(".herdr/worktrees").join(repo_name).join(&branch);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        host.create_dir_all(parent)?;
     }
-    git(repo, &["worktree", "add", "-b", &branch, &path.display().to_string(), &base_commit], 300)?;
+    host.git(repo, &["worktree", "add", "-b", &branch, &path.display().to_string(), &base_commit], 300)?;
     Ok(Worktree { path, branch, base_commit })
 }
 
 /// `git worktree remove` without force; the branch goes only if it has no
 /// commits beyond its base, or they're merged or pushed.
-pub fn cleanup_worktree(info: &AgentInfo) -> String {
+pub fn cleanup_worktree(host: &Host, info: &AgentInfo) -> String {
     let repo = PathBuf::from(&info.repo);
     let Some(path) = info.worktree.clone() else { return "no worktree".into() };
-    if Path::new(&path).exists() {
-        if let Err(e) = git(&repo, &["worktree", "remove", &path], 120) {
+    if host.exists(Path::new(&path)) {
+        if let Err(e) = host.git(&repo, &["worktree", "remove", &path], 120) {
             return format!("kept worktree {path}: {e:#}");
         }
     }
     // Branch names with slashes leave empty folders behind.
-    let root = paths::home().join(".herdr/worktrees");
-    let mut dir = Path::new(&path).parent().map(Path::to_path_buf);
-    while let Some(d) = dir {
-        if !d.starts_with(&root) || d == root || std::fs::remove_dir(&d).is_err() {
-            break;
-        }
-        dir = d.parent().map(Path::to_path_buf);
+    if let Some(parent) = Path::new(&path).parent() {
+        host.remove_empty_dirs(parent, &host.home().join(".herdr/worktrees"));
     }
     let Some(branch) = info.branch.clone() else { return "removed worktree".into() };
-    if git(&repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")], 30).is_err() {
+    if host.git(&repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")], 30).is_err() {
         return "removed worktree (branch already gone)".into();
     }
     let ahead = info
         .base_commit
         .as_ref()
-        .and_then(|b| git(&repo, &["rev-list", "--count", &format!("{b}..{branch}")], 30).ok())
+        .and_then(|b| host.git(&repo, &["rev-list", "--count", &format!("{b}..{branch}")], 30).ok())
         .and_then(|n| n.parse::<u64>().ok());
     let reason = match ahead {
         Some(0) => Some("no new commits"),
         _ => {
             let base_ref = info.base_branch.clone().unwrap_or_else(|| "origin/main".into());
-            let merged = git(&repo, &["merge-base", "--is-ancestor", &branch, &base_ref], 30).is_ok();
-            let pushed = git(&repo, &["branch", "-r", "--contains", &branch], 30)
+            let merged = host.git(&repo, &["merge-base", "--is-ancestor", &branch, &base_ref], 30).is_ok();
+            let pushed = host.git(&repo, &["branch", "-r", "--contains", &branch], 30)
                 .map(|s| !s.trim().is_empty())
                 .unwrap_or(false);
             if merged {
@@ -488,7 +482,7 @@ pub fn cleanup_worktree(info: &AgentInfo) -> String {
         }
     };
     match reason {
-        Some(why) => match git(&repo, &["branch", "-D", &branch], 30) {
+        Some(why) => match host.git(&repo, &["branch", "-D", &branch], 30) {
             Ok(_) => format!("removed worktree and branch ({why})"),
             Err(e) => format!("removed worktree; kept branch {branch}: {e:#}"),
         },
@@ -514,8 +508,10 @@ pub fn reap_worktrees() {
         if !live.is_empty() {
             continue;
         }
+        // A machine that can't be reached now gets another go next time.
+        let Ok(host) = Host::connect(r.machine.as_deref()) else { continue };
         let mut info = info;
-        info.worktree_cleanup = Some(cleanup_worktree(&info));
+        info.worktree_cleanup = Some(cleanup_worktree(&host, &info));
         r.agent = Some(info);
         let _ = r.save();
     }

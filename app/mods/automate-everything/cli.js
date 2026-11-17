@@ -32,6 +32,7 @@ export const history = (limit = 200) => json(["history", "--json", "--limit", St
 export const show = (id) => json(["show", id, "--json"]);
 export const get = (name) => json(["get", name]);
 export const status = () => json(["status", "--json"]);
+export const machines = () => json(["machines", "--json"]);
 export const runNow = (name) => json(["run", name, "--json"]);
 export const pause = (name) => call(["pause", name]);
 export const resume = (name) => call(["resume", name]);

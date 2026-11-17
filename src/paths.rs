@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn home() -> PathBuf {
     std::env::var_os("HOME")
@@ -8,10 +8,15 @@ pub fn home() -> PathBuf {
 
 /// Expands a leading `~` or `~/`.
 pub fn expand(p: &str) -> PathBuf {
+    expand_in(&home(), p)
+}
+
+/// Expands a leading `~` or `~/` against `home`: another machine's, say.
+pub fn expand_in(home: &Path, p: &str) -> PathBuf {
     if p == "~" {
-        home()
+        home.to_path_buf()
     } else if let Some(rest) = p.strip_prefix("~/") {
-        home().join(rest)
+        home.join(rest)
     } else {
         PathBuf::from(p)
     }
@@ -87,4 +92,18 @@ pub fn current_exe() -> std::io::Result<PathBuf> {
         return Ok(PathBuf::from(p));
     }
     Ok(exe)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_against_another_home() {
+        let home = Path::new("/home/me");
+        assert_eq!(expand_in(home, "~"), PathBuf::from("/home/me"));
+        assert_eq!(expand_in(home, "~/dev/x"), PathBuf::from("/home/me/dev/x"));
+        assert_eq!(expand_in(home, "/srv/x"), PathBuf::from("/srv/x"));
+        assert_eq!(expand_in(home, "~other/x"), PathBuf::from("~other/x"));
+    }
 }
