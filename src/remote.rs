@@ -77,8 +77,10 @@ pub fn reachable(machine: &str) -> Result<()> {
         bail!("unknown machine `{machine}` (known: {})", if known.is_empty() { "none".into() } else { known.join(", ") });
     };
     let state = m["state"].as_str().unwrap_or("unknown");
-    if state != "connected" {
-        bail!("machine `{machine}` is unreachable ({state})");
+    match state {
+        "connected" => {}
+        "unreachable" => bail!("machine `{machine}` is unreachable"),
+        _ => bail!("machine `{machine}` is unreachable ({state})"),
     }
     Ok(())
 }

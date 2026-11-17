@@ -621,7 +621,8 @@ fn machines(json_out: bool, probe: bool) -> Result<()> {
 
 /// Machines seen running automate-everything, kept in the state folder so
 /// one that's offline now still shows up (`reachable: false`, `seen_at`)
-/// instead of vanishing. One answering without it is forgotten.
+/// instead of vanishing. One answering without it, or removed from hc, is
+/// forgotten.
 fn remember_machines(v: &mut [serde_json::Value]) {
     let path = paths::state_dir().join("machines.json");
     let mut seen: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
@@ -629,6 +630,8 @@ fn remember_machines(v: &mut [serde_json::Value]) {
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
     let before = seen.clone();
+    // A machine removed from hc is forgotten too.
+    seen.retain(|name, _| v.iter().any(|m| m["name"].as_str() == Some(name)));
     for m in v.iter_mut() {
         let name = m["name"].as_str().unwrap_or("").to_string();
         let ae = &mut m["automate_everything"];
