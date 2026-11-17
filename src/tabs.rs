@@ -143,7 +143,7 @@ fn open(
         v.extend(argv);
         v
     };
-    let terminal = hc::launch(&hc::Launch { on: None, cwd: &cwd, labels, argv: full, keep: true })?;
+    let terminal = hc::launch(&hc::Launch { on: None, cwd: &cwd, labels, argv: full, keep: true, rm: false })?;
     let named = match &new_space {
         Some(space_name) => hc::name_space_and_tab(None, &space, space_name, &cwd, &tab, name, &terminal),
         None => hc::name_tab(&space, &tab, name, &terminal),

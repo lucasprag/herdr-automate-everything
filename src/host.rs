@@ -294,6 +294,7 @@ impl Remote {
             labels: labels.to_vec(),
             argv,
             keep: false,
+            rm: false,
         })
         .map_err(|e| anyhow!("machine `{}` unreachable: {e:#}", self.name))?;
 

@@ -8,10 +8,12 @@ mod history;
 mod lock;
 mod paths;
 mod proc;
+mod remote;
 mod runner;
 mod scheduler;
 mod service;
 mod tabs;
+mod transfer;
 
 use std::io::IsTerminal;
 
@@ -26,6 +28,10 @@ use history::{Run, Status, Trigger};
 #[derive(Parser)]
 #[command(name = "automate-everything", version, about = "Scheduled scripts and agent runs for the Herdr app")]
 struct Cli {
+    /// Ask automate-everything on another herdr-core machine (`hc machine
+    /// ls`) instead: its own config, history and scheduler
+    #[arg(long, global = true, value_name = "MACHINE")]
+    on: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -45,6 +51,12 @@ enum Cmd {
         wait: bool,
         #[arg(long)]
         json: bool,
+        /// The run's id (for `--on`, which picks it before starting the run)
+        #[arg(long, hide = true)]
+        run_id: Option<String>,
+        /// Only check it could run, start nothing (for `--on`)
+        #[arg(long, hide = true)]
+        check: bool,
     },
     /// Stop scheduling it, keeping the entry
     Pause { name: String },
@@ -62,6 +74,22 @@ enum Cmd {
         name: String,
         #[arg(long)]
         yes: bool,
+        /// Remove only the entry, keeping its run history
+        #[arg(long)]
+        keep_history: bool,
+    },
+    /// Hand the entry to another scheduler: `--to <machine>` makes that
+    /// machine keep the schedule and fire it (even while this one sleeps),
+    /// `--to here` brings it back. With `--on`, the entry comes from there.
+    /// Its history stays where it was.
+    Transfer {
+        name: String,
+        /// A machine (`hc machine ls`), or `here` for this one
+        #[arg(long)]
+        to: String,
+        /// JSON object of fields to change on the way (as for `set`)
+        #[arg(long)]
+        fields: Option<String>,
     },
     /// Runs and skips, newest first
     History {
@@ -98,6 +126,10 @@ enum Cmd {
     Machines {
         #[arg(long)]
         json: bool,
+        /// Also ask each connected one whether it runs automate-everything
+        /// (version, scheduler) so entries can be scheduled by it
+        #[arg(long)]
+        probe: bool,
     },
     /// Whether the scheduler is running, and where things live
     Status {
@@ -249,17 +281,20 @@ fn list(json_out: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_now(name: &str, wait: bool, json_out: bool) -> Result<()> {
+fn run_now(name: &str, wait: bool, json_out: bool, run_id: Option<String>, check_only: bool) -> Result<()> {
     let cfg = config::load()?;
     match cfg.find(name) {
         None => bail!("no automation named `{name}`"),
         Some(Slot::Invalid(i)) => bail!("`{name}` is invalid: {}", i.error),
         Some(Slot::Valid(_)) => {}
     }
+    if check_only {
+        return Ok(());
+    }
     let req = runner::Request {
         name: name.to_string(),
         trigger: Trigger::Manual,
-        run_id: history::new_id(name),
+        run_id: run_id.unwrap_or_else(|| history::new_id(name)),
         scheduled_for: None,
         caught_up: None,
     };
@@ -541,15 +576,44 @@ fn check(json_out: bool) -> Result<()> {
     Ok(())
 }
 
-fn machines(json_out: bool) -> Result<()> {
+fn machines(json_out: bool, probe: bool) -> Result<()> {
     let machines = hc::machines()?;
+    let mut v: Vec<_> = machines.iter().map(|m| json!({ "name": m["name"], "state": m["state"] })).collect();
+    if probe {
+        // All at once: each is a round trip, and an offline one isn't asked.
+        std::thread::scope(|s| {
+            let asks: Vec<_> = v
+                .iter()
+                .map(|m| {
+                    let name = m["name"].as_str().unwrap_or("").to_string();
+                    let connected = m["state"] == "connected";
+                    s.spawn(move || connected.then(|| remote::probe(&name)))
+                })
+                .collect();
+            for (m, ask) in v.iter_mut().zip(asks) {
+                m["automate_everything"] = ask.join().ok().flatten().unwrap_or(serde_json::Value::Null);
+            }
+        });
+    }
     if json_out {
-        let v: Vec<_> = machines.iter().map(|m| json!({ "name": m["name"], "state": m["state"] })).collect();
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
-    for m in &machines {
-        println!("{}  {}", m["name"].as_str().unwrap_or(""), m["state"].as_str().unwrap_or(""));
+    for m in &v {
+        let ae = &m["automate_everything"];
+        let extra = if !probe {
+            String::new()
+        } else if let Some(e) = ae["error"].as_str() {
+            format!("  ({e})")
+        } else if ae["installed"] == true {
+            let sched = if ae["scheduler_running"] == true { "scheduler running" } else { "scheduler not running" };
+            format!("  automate-everything {} ({sched})", ae["version"].as_str().unwrap_or("?"))
+        } else if ae["installed"] == false {
+            "  no automate-everything".into()
+        } else {
+            String::new()
+        };
+        println!("{}  {}{extra}", m["name"].as_str().unwrap_or(""), m["state"].as_str().unwrap_or(""));
     }
     Ok(())
 }
@@ -561,6 +625,9 @@ fn status(json_out: bool) -> Result<()> {
         "scheduler_running": running,
         "scheduler": if running { note } else { None },
         "service_installed": service::installed(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol": remote::PROTOCOL,
+        "timezone": cron::system_tz().name(),
         "config": paths::config_file(),
         "state": paths::state_dir(),
         "log": paths::scheduler_log(),
@@ -586,9 +653,20 @@ fn status(json_out: bool) -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(m) = &cli.on {
+        match &cli.cmd {
+            // Moves between here and there: done from here.
+            Cmd::Transfer { .. } => {}
+            Cmd::Scheduler | Cmd::RunInternal { .. } => bail!("--on doesn't apply to this command"),
+            _ => {
+                let args = remote::strip_on(std::env::args().skip(1), m);
+                std::process::exit(remote::proxy(m, &args)?);
+            }
+        }
+    }
     match cli.cmd {
         Cmd::List { json } => list(json),
-        Cmd::Run { name, wait, json } => run_now(&name, wait, json),
+        Cmd::Run { name, wait, json, run_id, check } => run_now(&name, wait, json, run_id, check),
         Cmd::Pause { name } => {
             config::set_paused(&name, true)?;
             println!("paused {name}");
@@ -604,13 +682,34 @@ fn main() -> Result<()> {
             println!("moved {name} to {to}");
             Ok(())
         }
-        Cmd::Delete { name, yes } => {
-            if !yes && !confirm(&format!("Delete `{name}` and its run history?")) {
+        Cmd::Delete { name, yes, keep_history } => {
+            let what = if keep_history { "" } else { " and its run history" };
+            if !yes && !confirm(&format!("Delete `{name}`{what}?")) {
                 bail!("not deleted (pass --yes to skip the question)");
             }
             config::remove(&name)?;
-            let n = history::delete_for(&name);
-            println!("deleted {name} and {n} history records");
+            if keep_history {
+                println!("deleted {name}, kept its history");
+            } else {
+                let n = history::delete_for(&name);
+                println!("deleted {name} and {n} history records");
+            }
+            Ok(())
+        }
+        Cmd::Transfer { name, to, fields } => {
+            let fields: Option<serde_json::Value> =
+                fields.map(|f| serde_json::from_str(&f)).transpose().context("--fields must be a JSON object")?;
+            let fields = match &fields {
+                Some(v) => Some(v.as_object().ok_or_else(|| anyhow!("--fields must be a JSON object"))?),
+                None => None,
+            };
+            let from = cli.on.as_deref().map(transfer::Side::parse).unwrap_or(transfer::Side::Here);
+            let to = transfer::Side::parse(&to);
+            transfer::transfer(&name, from, to.clone(), fields)?;
+            match to {
+                transfer::Side::Here => println!("{name} is now scheduled by this machine"),
+                transfer::Side::On(m) => println!("{name} is now scheduled by {m}"),
+            }
             Ok(())
         }
         Cmd::History { name, limit, json } => history_cmd(name, limit, json),
@@ -642,7 +741,7 @@ fn main() -> Result<()> {
         }
         Cmd::Check { json } => check(json),
         Cmd::Status { json } => status(json),
-        Cmd::Machines { json } => machines(json),
+        Cmd::Machines { json, probe } => machines(json, probe),
         Cmd::Service { action } => service::run(action),
         Cmd::Tab { action } => tabs::run(action),
         Cmd::Scheduler => scheduler::serve(),

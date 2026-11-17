@@ -78,6 +78,8 @@ pub struct Launch<'a> {
     pub argv: Vec<String>,
     /// Replace a lost program with a shell (`--keep`), as for an agent.
     pub keep: bool,
+    /// Remove the terminal once its program ends (`--rm`).
+    pub rm: bool,
 }
 
 /// Starts a terminal that belongs to no one, so it outlives us.
@@ -88,6 +90,9 @@ pub fn launch(l: &Launch) -> Result<String> {
         .collect();
     if l.keep {
         args.push("--keep".into());
+    }
+    if l.rm {
+        args.push("--rm".into());
     }
     if let Some(m) = l.on {
         args.push("--on".into());
@@ -191,10 +196,16 @@ impl ExecOut {
 /// most 600 s, for short helpers. Errs when hc couldn't run it at all (an
 /// unknown or unreachable machine); the program's own failure is in the result.
 pub fn exec_on(machine: &str, argv: &[&str], timeout_secs: u64) -> Result<ExecOut> {
+    exec_on_within(machine, argv, timeout_secs, Duration::from_secs(60))
+}
+
+/// `exec_on`, giving up on hc itself `grace` after the program's own timeout
+/// (a machine that stops answering mid-call).
+pub fn exec_on_within(machine: &str, argv: &[&str], timeout_secs: u64, grace: Duration) -> Result<ExecOut> {
     let t = timeout_secs.clamp(1, 600).to_string();
     let mut args = vec!["exec", "--json", "--on", machine, "--timeout", &t, "--"];
     args.extend_from_slice(argv);
-    let (code, v, err) = run_json(&args, Duration::from_secs(timeout_secs.min(600) + 60))?;
+    let (code, v, err) = run_json(&args, Duration::from_secs(timeout_secs.min(600)) + grace)?;
     if code != Some(0) || v.is_null() {
         bail!("{}", error_message(&err).unwrap_or_else(|| format!("hc exec failed (exit {code:?})")));
     }

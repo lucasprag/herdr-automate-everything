@@ -138,6 +138,7 @@ pub fn run(a: &Automation, host: &Host, run: &mut Run) -> Result<()> {
     let terminal = hc::launch(&hc::Launch {
         on,
         keep: true,
+        rm: false,
         cwd: &info.cwd,
         labels: vec![
             ("herdr.space".into(), space_id.clone()),
