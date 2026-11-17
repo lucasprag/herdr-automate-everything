@@ -1,6 +1,6 @@
 ---
 name: automate-everything
-description: Scheduled scripts and agent runs on this computer, macOS or Linux (automate-everything, the Herdr Automations panel), not Orca or cloud routines. Use to schedule something recurring here, to check on automations (is the scheduler up, what ran, why a run failed or was skipped), or to change one (schedule, prompt, pause, resume, run now, delete).
+description: Scheduled scripts and agent runs on this computer, macOS or Linux (automate-everything, the Herdr Automations panel), not Orca or cloud routines. Use to schedule something recurring here, to check on automations (is the scheduler up, what ran, why a run failed or was skipped), or to change one (schedule, prompt, pause, resume, run now, delete), here or scheduled by another herdr-core machine (`--on`).
 ---
 
 # Automations
@@ -39,10 +39,11 @@ What a run's status means:
 - **Frequent agent schedules** (hourly or more often) should use `space = "shared"`, so runs open as tabs in one space instead of filling the sidebar.
 - **A new entry goes live at its next matching minute.** Past fires never run, so there's no backfill. Prove the entry first with `run <name> --wait`: it runs even while paused and skips the precheck. For an agent, `--wait` lasts as long as the agent does, so use a plain `run` and follow it with `history`.
 - **Running on another machine:** `machine = "<name>"` (one of `automate-everything machines`) runs the entry on that herdr-core machine while this Mac keeps scheduling it. `command`, `cwd`, `repo`, `precheck` and `prompt_file` are paths on that machine (`~` is its home), so check them there (`hc exec --on <name> ls <path>`), not here. An unreachable machine fails the run with a note; `check` reports unknown machines and missing paths.
+- **Scheduled by another machine** (so it fires while this Mac sleeps): the entry lives in that machine's own config. `automate-everything --on <machine> <command>` runs any command there (`list`, `get`, `set`, `run`, `pause`, `history`, `show`...), against its config and history. `machines --probe` shows which machines run automate-everything. On the machine it's a local entry: no `machine` field, paths are its own, and an empty `timezone` means its timezone, so set one explicitly. To move an existing entry between this Mac's scheduler and the machine's, use `transfer <name> --to <machine>` (or `--on <machine> transfer <name> --to here`), never set-then-delete by hand: transfer never leaves it in both or in neither, and keeps history where it was. An offline machine fails at once; say so rather than retrying.
 - **Fanning out from an agent run:** `automate-everything tab open` (see `--help`) starts a helper as another tab in the run's space (`--space <id>` for another space, `--new-space <name>` for a new one), and `tab close --self` is the helper's last command. When the run succeeds, the runner closes only the run's own tab; the space closes once its last tab does.
 
 ## Pausing, resuming, deleting
 
-`pause` keeps the entry and its history. `delete --yes` removes both, so confirm with the user first.
+`pause` keeps the entry and its history. `delete --yes` removes both, so confirm with the user first (`--keep-history` removes only the entry). Add `--on <machine>` for an entry another machine schedules.
 
 Entries ported from Orca start paused. Before resuming one, check that Orca no longer fires it (`orca automations list`); otherwise it runs twice.

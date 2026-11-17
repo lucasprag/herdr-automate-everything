@@ -92,6 +92,25 @@ command line or by editing the config file.
 Agent automations need herdr-core (`hc`) and the agent (`claude`) on the PATH
 your login shell sets up; they haven't been tested on Linux yet.
 
+#### Managing it from your Mac
+
+If the Linux machine is a herdr-core machine your Mac knows (`hc machine ls`),
+you can manage its automations from the Mac: in the Automations panel, or with
+`--on`:
+
+```sh
+automate-everything machines --probe            # which machines run it, and which version
+automate-everything --on lab list
+automate-everything --on lab run hello
+automate-everything --on lab history hello
+```
+
+Its entries show in the panel in their own group, "Scheduled by lab", with
+run now, pause, resume, edit, delete and history working as for this Mac's.
+They keep running while the Mac sleeps or is off. If the machine can't be
+reached the group says so, with when it was last seen, and its buttons do
+nothing until it's back. See [Scheduled by another machine](#scheduled-by-another-machine).
+
 ## What's in this repo
 
 | Path | What it is |
@@ -159,7 +178,13 @@ Each automation has three buttons:
 
 To change the order, drag an automation up or down by the dotted handle on its left.
 
-**History** lists every run. Click one to see what happened: when it ran, how
+**Scheduled by another machine:** an automation that runs on a machine running
+automate-everything itself can be scheduled by that machine instead (**Scheduled
+by** in the edit form), so it fires while this Mac sleeps. Those show below this
+Mac's, in a group per machine, refreshed every minute. A machine that can't be
+reached is marked as such and its buttons do nothing until it's back.
+
+**History** lists every run, other machines' included. Click one to see what happened: when it ran, how
 long it took, its output and, for an agent, what was on its screen at the end.
 
 | Status | What it means |
@@ -288,6 +313,42 @@ machine = "lab"                # default: this Mac
 command = "uname -a; hostname"
 ```
 
+### Scheduled by another machine
+
+With `machine` set, this Mac's scheduler fires the run and the run executes on
+the machine, so nothing runs while this Mac sleeps. To have the machine keep
+the schedule itself, put the entry in *its* config instead: the machine needs
+automate-everything installed with its service running (see [On Linux, without
+the Herdr app](#on-linux-without-the-herdr-app)).
+
+From this Mac, `--on <machine>` runs any command there, through `hc exec`:
+
+```sh
+automate-everything --on lab set lab-probe --create --fields '{"kind":"script","schedule":"*/30 * * * *","command":"uname -a"}'
+automate-everything --on lab list
+```
+
+On the machine it's an ordinary local entry: no `machine` field, paths, `~`
+and the environment are its own, and its runs and history stay there. An empty
+`timezone` means the machine's own, so the panel writes this Mac's in when you
+leave it empty.
+
+`transfer` moves an entry between the two schedulers. It creates the entry on
+the target paused, removes it from the source, then resumes it, so it never
+fires from both and is never in neither (if the removal fails, the copy is
+removed again). History stays where it was.
+
+```sh
+automate-everything transfer lab-probe --to lab          # lab schedules it from now on
+automate-everything --on lab transfer lab-probe --to here   # back to this Mac (machine = "lab")
+```
+
+`--on` needs the same release on both sides (`machines --probe` shows each
+machine's version), and it never waits on an offline machine: one hc doesn't
+show as connected fails at once, and calls time out after 10 s (30 s for
+changes). A field the machine's version doesn't know is refused there, and
+nothing is written.
+
 ## How runs behave, in detail
 
 - **Scripts** run in the background with no space. Output and exit code go into
@@ -322,7 +383,8 @@ command = "uname -a; hostname"
   this Mac's. A script's output comes back into its record as usual, and a
   timeout stops it there. An agent's space shows under that machine. If the
   machine can't be reached, the run fails and says so. Scheduling stays on
-  this Mac, so nothing runs while it sleeps.
+  this Mac, so nothing runs while it sleeps, unless the machine schedules it
+  itself ([Scheduled by another machine](#scheduled-by-another-machine)).
 - **Catching up after sleep:** the newest missed time runs once if it's inside
   the grace window; otherwise one missed record covers them all. Daylight
   saving: a fixed-time automation runs once when clocks go back and isn't lost
@@ -335,11 +397,13 @@ automate-everything list | run <name> [--wait] | pause <name> | resume <name> | 
 automate-everything move <name> --to <position>
 automate-everything history [<name>] | show <run-id>
 automate-everything get <name> | set <name> --fields '<json>' [--create] | check
-automate-everything status | machines | service install|uninstall|restart | scheduler
+automate-everything status | machines [--probe] | service install|uninstall|restart | scheduler
+automate-everything transfer <name> --to <machine>|here
+automate-everything --on <machine> <any of the above>
 ```
 
 Add `--json` to `list`, `history`, `show`, `check` and `machines` for
-machine-readable output.
+machine-readable output. `delete --keep-history` removes only the entry.
 
 ### Extra tabs from an agent run
 

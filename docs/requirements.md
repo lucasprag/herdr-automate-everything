@@ -67,16 +67,25 @@ The panel follows Orca's automations interface: a home page and a history page.
 
 ## Runs on another machine
 
-29. **A per-automation `machine`**, one of herdr-core's machines (`hc machine ls`). Unset means this Mac, as before. Scheduling, the overlap guard and history stay on this Mac; only the run executes on the machine.
+29. **A per-automation `machine`**, one of herdr-core's machines (`hc machine ls`). Unset means this Mac, as before. Scheduling, the overlap guard and history stay on this Mac; only the run executes on the machine (unless the machine schedules it, below).
 30. **Paths and environment are the machine's.** `command`, `cwd`, `repo`, `precheck`, `prompt_file` and worktrees resolve there, `~` being its home. Runs get the machine's own login environment plus the entry's `env`; this Mac's is never sent.
 31. **Scripts on a machine behave like local ones:** output and exit code in the run's record, and a timeout stops the script and everything it started on the machine.
 32. **Agent runs on a machine** open their space on it, and their worktrees, cleanup and stopping happen there.
 33. **An unreachable machine fails the run** with a note saying so. No retries; the next fire tries again.
 34. **The machine is checked and shown.** `check` and `set` refuse a machine hc doesn't know and warn when it's only offline. The machine shows in `list`, `show`, history and the panel.
 
+## Scheduled by another machine
+
+35. **An entry can be scheduled by the machine it runs on**, so it fires while this Mac sleeps or is off. It lives in that machine's own config, as a local entry there (no `machine`); its runs and history live there too.
+36. **Managed from this Mac.** `--on <machine>` runs any CLI command with automate-everything on that machine (`hc exec`), so the panel, the skill and the terminal all reach it the same way. `machines --probe` says which connected machines run it and with which version and protocol; machines seen before are remembered, so an offline one still shows.
+37. **Never hangs.** A machine hc doesn't show as connected fails at once; calls time out (10 s for reads, 30 s for changes). The panel refreshes other machines every minute, apart from this Mac's refresh, keeps their last answer on screen, and marks one it can't reach (with when it was last seen), its buttons inert.
+38. **Moving between schedulers** (`transfer`) creates the entry on the target paused, removes it from the source keeping the source's history, then resumes it. It never fires from both or ends up in neither; a failed removal removes the copy again. An empty timezone is replaced by the source's, so the schedule keeps its meaning.
+39. **Versions.** `--on` needs protocol 1 on the machine (`status --json` reports `version`, `protocol` and `timezone`); an older one is shown as needing an update and isn't offered. A field the machine doesn't know is refused there and nothing is written.
+40. **Unchanged when no machine runs it:** no groups, no "Scheduled by", same panel as before.
+
 ## Out of scope
 
-- Scheduling from another machine. The scheduler always runs on this Mac; running it on the remote itself is the answer for a Mac that sleeps.
+- Scheduling across two machines at once, or moving an entry between two other machines (`transfer` goes between this machine and one other).
 - RRULE schedules and presets; cron only.
 - Token and cost tracking per run (Orca shows it).
 - Herdr TUI `workflow:` and `session:`.
