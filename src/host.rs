@@ -39,18 +39,41 @@ const POLL: Duration = Duration::from_secs(1);
 const GIT_MARKER: &str = "\u{0}__AUTOMATE_EVERYTHING_GIT__\u{0}";
 /// How long hc may fail to answer about a running command before giving up.
 const LOST_AFTER: Duration = Duration::from_secs(120);
+/// How long a command stopped at its timeout may take to end before giving up
+/// on it (it may still be running there).
+const KILL_WAIT: Duration = Duration::from_secs(60);
 
-/// Runs the command it's given, in its own login shell. Arguments:
-/// inner script, output folder, cwd, command, then KEY=VALUE pairs.
-const OUTER: &str = r#"inner=$1; shift; mkdir -p "$1" || exit 125
+/// Runs a /bin/sh script inside the machine's login shell, whatever that
+/// shell is: the script goes in `$AE_SCRIPT`, and the only thing the login
+/// shell is asked to do, `exec /bin/sh -c "$AE_SCRIPT"`, reads the same in
+/// sh, bash, zsh and fish. Arguments: output folder, script.
+const OUTER: &str = r#"mkdir -p "$1" || exit 125
+AE_SCRIPT=$2; export AE_SCRIPT
 exec </dev/null
-exec "${SHELL:-/bin/sh}" -lic 'exec "$@"' sh /bin/sh -c "$inner" sh "$@""#;
-/// After the login shell: the entry's env on top, output to files, cwd, run.
-const INNER: &str = r#"d=$1 c=$2 cmd=$3; shift 3
-for kv do export "$kv"; done
-exec >"$d/stdout.log" 2>"$d/stderr.log" </dev/null
-cd "$c" || exit 126
-exec /bin/sh -c "$cmd""#;
+exec "${SHELL:-/bin/sh}" -lic 'exec /bin/sh -c "$AE_SCRIPT"'"#;
+/// The same for a short helper in a non-interactive login shell. Arguments:
+/// the login shell, script.
+const LOGIN: &str = r#"AE_SCRIPT=$2; export AE_SCRIPT
+exec "$1" -lc 'exec /bin/sh -c "$AE_SCRIPT"'"#;
+
+/// `s` as one /bin/sh word.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r#"'\''"#))
+}
+
+/// After the login shell: the entry's env on top, output to files in `dir`,
+/// `cwd`, then the command.
+fn inner_script(dir: &Path, cwd: &Path, command: &str, vars: &BTreeMap<String, String>) -> String {
+    let d = |name: &str| sh_quote(&dir.join(name).display().to_string());
+    let mut s = String::from("unset AE_SCRIPT\n");
+    for (k, v) in vars {
+        s.push_str(&format!("export {k}={}\n", sh_quote(v)));
+    }
+    s.push_str(&format!("exec >{} 2>{} </dev/null\n", d("stdout.log"), d("stderr.log")));
+    s.push_str(&format!("cd {} || exit 126\n", sh_quote(&cwd.display().to_string())));
+    s.push_str(&format!("exec /bin/sh -c {}", sh_quote(command)));
+    s
+}
 
 impl Host {
     /// This Mac for None; for a machine, asks it for its home and shell,
@@ -197,11 +220,15 @@ done"#;
             Host::Remote(r) => {
                 // A login shell for the machine's PATH. Its profile may print
                 // things; git's own output starts after the marker.
-                let repo = repo.display().to_string();
-                let script = format!(r#"printf '{}'; exec "$@""#, GIT_MARKER.replace('\0', "\\0"));
-                let mut argv = vec![r.shell.as_str(), "-lc", &script, "sh", "git", "-C", &repo];
-                argv.extend_from_slice(args);
-                let o = r.exec(&argv, timeout)?;
+                let mut git = vec!["git".to_string(), "-C".into(), repo.display().to_string()];
+                git.extend(args.iter().map(|a| a.to_string()));
+                let words: Vec<String> = git.iter().map(|w| sh_quote(w)).collect();
+                let script = format!(
+                    "unset AE_SCRIPT; printf '{}'; exec {}",
+                    GIT_MARKER.replace('\0', "\\0"),
+                    words.join(" ")
+                );
+                let o = r.exec(&["/bin/sh", "-c", LOGIN, "sh", &r.shell, &script], timeout)?;
                 if o.truncated {
                     bail!("git {}: output too big for hc to copy back whole", args.join(" "));
                 }
@@ -252,9 +279,14 @@ impl Remote {
     ) -> Result<RemoteRun> {
         let start = Instant::now();
         let dir = self.home.join(REMOTE_RUNS).join(key);
-        let mut argv: Vec<String> = vec!["/bin/sh".into(), "-c".into(), OUTER.into(), "sh".into(), INNER.into()];
-        argv.extend([dir.display().to_string(), cwd.display().to_string(), command.into()]);
-        argv.extend(vars.iter().map(|(k, v)| format!("{k}={v}")));
+        let argv: Vec<String> = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            OUTER.into(),
+            "sh".into(),
+            dir.display().to_string(),
+            inner_script(&dir, cwd, command, vars),
+        ];
         let home = self.home.display().to_string();
         let addr = hc::launch(&hc::Launch {
             on: Some(&self.name),
@@ -288,6 +320,14 @@ impl Remote {
                     let _ = hc::kill(&addr);
                     killed_at = Some(now);
                 }
+                // Stopped, but it won't end: give up on it rather than wait forever.
+                Some(_) if start.elapsed() >= timeout + KILL_WAIT => {
+                    let m = &self.name;
+                    break Err(format!(
+                        "stopped at its timeout on `{m}` but it hadn't ended {}s later (it may still be running there)",
+                        KILL_WAIT.as_secs()
+                    ));
+                }
                 // `hc kill` escalates on its own; ask again now and then.
                 Some(t) if now >= t + Duration::from_secs(10) => {
                     let _ = hc::kill(&addr);
@@ -303,23 +343,33 @@ impl Remote {
         let duration = start.elapsed();
 
         let m = &self.name;
+        // The last FETCH_MAX bytes, saying so when there were more (its size
+        // comes first, on stderr).
         let fetch = |name: &str| -> Vec<u8> {
             let f = dir.join(name).display().to_string();
             let max = FETCH_MAX.to_string();
-            match self.exec(&["tail", "-c", &max, "--", &f], 120) {
-                Ok(o) if o.ok() && o.truncated => {
-                    let mut b = format!("[{name} was cut on the way back from `{m}`]\n").into_bytes();
+            let script = r#"n=$(wc -c < "$1") || exit 1; echo "$n" >&2; exec tail -c "$2" -- "$1""#;
+            match self.exec(&["/bin/sh", "-c", script, "sh", &f, &max], 120) {
+                Ok(o) if o.ok() => {
+                    let size: usize = o.stderr_text().trim().parse().unwrap_or(0);
+                    let mut b = Vec::new();
+                    if size > FETCH_MAX {
+                        b.extend(format!("[the first {} bytes of {name} were left on `{m}`]\n", size - FETCH_MAX).bytes());
+                    } else if o.truncated {
+                        b.extend(format!("[{name} was cut on the way back from `{m}`]\n").bytes());
+                    }
                     b.extend_from_slice(&o.stdout);
                     b
                 }
-                Ok(o) if o.ok() => o.stdout,
                 Ok(o) => format!("[could not copy {name} back from `{m}`: {}]\n", o.stderr_text()).into_bytes(),
                 Err(e) => format!("[could not copy {name} back from `{m}`: {e:#}]\n").into_bytes(),
             }
         };
         let stdout = fetch("stdout.log");
         let mut stderr = fetch("stderr.log");
-        if exit_code == Some(125) {
+        // 125 is also a command's own exit code: only the missing folder says
+        // it couldn't be made.
+        if exit_code == Some(125) && self.test("-d", &dir) == Some(false) {
             stderr.extend_from_slice(format!("[could not make {} on `{m}`]\n", dir.display()).as_bytes());
         }
         let _ = self.exec(&["rm", "-rf", "--", &dir.display().to_string()], 60);
@@ -342,6 +392,30 @@ fn after_marker<'a>(out: &'a [u8], marker: &[u8]) -> &'a [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoted_words_survive_sh() {
+        for w in ["plain", "it's", "a b", "$HOME", "`x`", "back\\slash", ""] {
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", &format!("printf %s {}", sh_quote(w))])
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), w);
+        }
+    }
+
+    #[test]
+    fn the_inner_script_runs_the_command_with_its_env_in_its_folder() {
+        let tmp = std::env::temp_dir().join(format!("ae-inner-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let vars = BTreeMap::from([("GREETING".to_string(), "it's \"hi\"".to_string())]);
+        let script = inner_script(&tmp, Path::new("/"), "printf '%s %s' \"$GREETING\" \"$(pwd)\"", &vars);
+        let status = std::process::Command::new("/bin/sh").args(["-c", &script]).status().unwrap();
+        assert!(status.success());
+        let out = std::fs::read_to_string(tmp.join("stdout.log")).unwrap();
+        assert_eq!(out, "it's \"hi\" /");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 
     #[test]
     fn git_output_starts_after_the_marker() {
