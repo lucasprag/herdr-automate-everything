@@ -97,8 +97,8 @@ your login shell sets up; they haven't been tested on Linux yet.
 If the Linux machine is a herdr-core machine your Mac knows (`hc machine ls`),
 define the automation on the Mac and add the machine to its `runs_on` (in the
 panel: **Runs on** in the edit form). The Mac sends the machine a copy, and
-the machine's own scheduler fires it, so it runs while the Mac sleeps or is
-off. See [Running on other machines](#running-on-other-machines).
+the machine's own scheduler fires it, so it doesn't depend on the Mac being
+awake. See [Running on other machines](#running-on-other-machines).
 
 `--on` runs any command there, for a look at its own state:
 
@@ -176,8 +176,8 @@ Each automation has three buttons:
 To change the order, drag an automation up or down by the dotted handle on its left.
 
 **Runs on** in the edit form picks where an automation runs: this Mac and/or
-machines running automate-everything. Each of those fires its own copy, so it
-runs while this Mac sleeps. Its line shows where it runs (`This Mac + lab`) and
+machines running automate-everything. Each of those fires its own copy with its
+own scheduler, whether or not this Mac is awake. Its line shows where it runs (`This Mac + lab`) and
 its last run wherever that was; a machine that can't be reached, or hasn't got
 the latest copy yet, is said so under it. Automations a machine has in its own
 config show after this Mac's, marked "defined on lab", and a name defined in
@@ -304,7 +304,7 @@ Every run gets the environment variables `HERDR_AUTOMATION`,
 `runs_on` lists where an automation runs: `local` (this machine) and/or
 herdr-core machines (`hc machine ls`) that run automate-everything with its
 service. Each machine gets a copy of the automations meant for it and fires
-them with its own scheduler, so they run while this Mac sleeps or is off. You
+them with its own scheduler, so they don't depend on this Mac being awake. You
 define and change them here; the copy can't be changed there.
 
 ```toml

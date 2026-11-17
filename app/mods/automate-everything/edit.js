@@ -3,8 +3,7 @@
 // back as an error here and nothing is written.
 //
 // "Runs on" picks where: this Mac and/or machines running automate-everything
-// (`runs_on`), each of which gets a copy and fires it itself, even while this
-// Mac sleeps. A machine without automate-everything can still be picked on its
+// (`runs_on`), each of which gets a copy and fires it itself. A machine without automate-everything can still be picked on its
 // own: this Mac fires the run and it executes there through hc (`machine`).
 // An automation a machine defines itself is edited there (`--on`), without
 // "Runs on".
@@ -112,7 +111,7 @@ export class Edit {
 
   // An entry this Mac runs on a machine (`machine`) that now runs
   // automate-everything itself: offered as running there, fired by that
-  // machine, so it runs while this Mac sleeps. Saving makes it so.
+  // machine, so it doesn't depend on this Mac. Saving makes it so.
   upgrade() {
     const v = this.choice.via;
     if (v && this.capable(v)) Object.assign(this.choice, { via: null, places: [v] });
@@ -245,19 +244,19 @@ export class Edit {
 
   // A checkbox per place: "This Mac", then each hc machine (with its state
   // when not connected), plus any the entry names that hc doesn't list (any
-  // more). Each says what ticking it means.
+  // more). Each place fires it with its own scheduler; only a machine without
+  // automate-everything needs a word, since this Mac drives it.
   placePicker(t) {
     const c = this.choice;
     const names = this.machines.map((m) => m.name);
     for (const p of [...c.places, c.via]) if (p && p !== "local" && !names.includes(p)) names.push(p);
     const ticked = (p) => (c.via ? p === c.via || p === "local" : c.places.includes(p));
-    const rows = [["local", "This Mac", "This Mac's scheduler fires it, only while this Mac is awake."]];
+    const rows = [["local", "This Mac", null]];
     for (const n of names) {
       const m = this.machines.find((x) => x.name === n);
       const state = !m ? "unknown to hc" : m.state !== "connected" ? m.state : null;
-      const hint = this.capable(n)
-        ? `${n} fires its own copy, even while this Mac sleeps.`
-        : `No automate-everything on ${n}: this Mac runs it there through hc, only while this Mac is awake. Can't be combined with another machine.`;
+      const hint = this.capable(n) ? null
+        : `No automate-everything there: this Mac fires it and runs it on ${n} through hc. Can't be combined with another machine.`;
       rows.push([n, state ? `${n} (${state})` : n, hint]);
     }
     const box = (on) => div().size(14).mt(1).flex_none().flex().items_center().justify_center()
@@ -274,7 +273,7 @@ export class Edit {
         .child(box(on))
         .child(v_flex().gap(1).min_w(0)
           .child(div().text_size(12.5).text_color(t.foreground).child(label))
-          .child(div().text_size(11).text_color(t.dim).child(hint)));
+          .when(Boolean(hint), (el) => el.child(div().text_size(11).text_color(t.dim).child(hint))));
     }));
     const elsewhere = c.via || c.places.some((p) => p !== "local");
     return elsewhere

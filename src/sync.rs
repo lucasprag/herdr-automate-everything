@@ -1,7 +1,7 @@
 //! Automations defined here that run on other machines (`runs_on`): each such
 //! machine gets a copy of its entries and its own scheduler fires them, so
-//! they run while this one sleeps. The definition stays here; the copy there
-//! can't be changed there.
+//! they don't depend on this one being awake. The definition stays here; the
+//! copy there can't be changed there.
 //!
 //! What a machine gets is always the whole set meant for it, replacing the
 //! last one in one write (`_sync-in`), so nothing can end up half-moved: an
