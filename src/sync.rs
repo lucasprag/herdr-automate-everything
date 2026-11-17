@@ -182,7 +182,12 @@ pub fn send() -> Result<Vec<Outcome>> {
     let _lock = FileLock::acquire(&paths::state_dir().join("sync.lock"))?;
     // Read again under the lock: another send may have just finished.
     sent = load_sent();
-    let machines: Vec<String> = copies.keys().chain(sent.keys()).cloned().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    // A machine removed from hc that no entry runs on any more: nothing to send.
+    if let Ok(known) = crate::hc::machines() {
+        let known: Vec<&str> = known.iter().filter_map(|m| m["name"].as_str()).collect();
+        sent.retain(|m, _| copies.contains_key(m) || known.contains(&m.as_str()));
+    }
+    let machines: std::collections::BTreeSet<String> = copies.keys().chain(sent.keys()).cloned().collect();
     let source = source_id();
     let now = Utc::now();
     let mut out = Vec::new();

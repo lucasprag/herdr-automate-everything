@@ -74,19 +74,19 @@ The panel follows Orca's automations interface: a home page and a history page.
 33. **An unreachable machine fails the run** with a note saying so. No retries; the next fire tries again.
 34. **The machine is checked and shown.** `check` and `set` refuse a machine hc doesn't know and warn when it's only offline. The machine shows in `list`, `show`, history and the panel.
 
-## Scheduled by another machine
+## Runs on other machines, defined here
 
-35. **An entry can be scheduled by the machine it runs on**, so it fires while this Mac sleeps or is off. It lives in that machine's own config, as a local entry there (no `machine`); its runs and history live there too.
-36. **Managed from this Mac.** `--on <machine>` runs any CLI command with automate-everything on that machine (`hc exec`), so the panel, the skill and the terminal all reach it the same way. `machines --probe` says which connected machines run it and with which version and protocol; machines seen before are remembered, so an offline one still shows.
-37. **Never hangs.** A machine hc doesn't show as connected fails at once; calls time out (10 s for reads, 30 s for changes). The panel refreshes other machines every minute and right after a change made from it, apart from this Mac's refresh, keeps their last answer on screen, and marks one it can't reach (with when it was last seen), its buttons inert.
-41. **One list.** Other machines' entries are in the same list as this Mac's (after them, marked with the machine that schedules them), not in separate groups. A name scheduled by more than one machine fires from each and is flagged on each line.
-38. **Moving between schedulers** (`transfer`) creates the entry on the target paused, removes it from the source keeping the source's history, then resumes it. It never fires from both or ends up in neither; a failed removal removes the copy again. An empty timezone is replaced by the source's, so the schedule keeps its meaning.
-39. **Versions.** `--on` needs protocol 1 on the machine (`status --json` reports `version`, `protocol` and `timezone`); an older one is shown as needing an update and isn't offered. A field the machine doesn't know is refused there and nothing is written.
-40. **Unchanged when no machine runs it:** no groups, no "Scheduled by", same panel as before.
+35. **Defined once, here.** An automation's `runs_on` lists where it runs: `local` and/or machines running automate-everything. No duplicates to keep in step: the definition lives in this machine's config only.
+36. **Each machine fires its own copy**, so it runs while this Mac sleeps or is off. This Mac sends each machine the whole set of automations meant for it (`_sync-in`), replacing the last in one write; the machine loads them next to its own config and can't change them. Paths, environment, runs and history are the machine's.
+37. **Copies follow changes**: right after a change from the CLI or the panel, and the scheduler checks every minute (and resends every half hour). An offline machine keeps its last copy and gets the new one when it's back. Dropping a machine from `runs_on` removes its copy. An empty timezone is written in as this Mac's.
+38. **Never hangs.** `--on <machine>` runs any CLI command there (`hc exec`); a machine hc doesn't show as connected fails at once, and calls time out (10 s for reads, 30 s for changes). `machines --probe` says which machines run automate-everything and with which version, remembering ones seen before so an offline one still shows.
+39. **One line per automation in the panel**, with where it runs and its last run wherever it was; Run now runs it everywhere. A machine that can't be reached, or hasn't got the latest copy, is said so on the line. Automations a machine defines itself show after, marked, and a name defined in both places is flagged.
+40. **Versions.** Copies need protocol 2 on the machine (`status --json` reports `version`, `protocol`, `timezone` and `source_id`); an older one is shown as needing an update. A field it doesn't know makes its copy invalid there, with the error.
+41. **Unchanged when nothing runs elsewhere:** no `runs_on`, no copies, no hc calls; the same panel as before.
 
 ## Out of scope
 
-- Scheduling across two machines at once, or moving an entry between two other machines (`transfer` goes between this machine and one other).
+- Defining an automation on a machine and editing it from another (a machine's own automations are changed there, with `--on`).
 - RRULE schedules and presets; cron only.
 - Token and cost tracking per run (Orca shows it).
 - Herdr TUI `workflow:` and `session:`.

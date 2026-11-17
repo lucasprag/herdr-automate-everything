@@ -92,24 +92,21 @@ command line or by editing the config file.
 Agent automations need herdr-core (`hc`) and the agent (`claude`) on the PATH
 your login shell sets up; they haven't been tested on Linux yet.
 
-#### Managing it from your Mac
+#### Running automations defined on your Mac
 
 If the Linux machine is a herdr-core machine your Mac knows (`hc machine ls`),
-you can manage its automations from the Mac: in the Automations panel, or with
-`--on`:
+define the automation on the Mac and add the machine to its `runs_on` (in the
+panel: **Runs on** in the edit form). The Mac sends the machine a copy, and
+the machine's own scheduler fires it, so it runs while the Mac sleeps or is
+off. See [Running on other machines](#running-on-other-machines).
+
+`--on` runs any command there, for a look at its own state:
 
 ```sh
 automate-everything machines --probe            # which machines run it, and which version
 automate-everything --on lab list
-automate-everything --on lab run hello
 automate-everything --on lab history hello
 ```
-
-Its entries show in the panel's list after this Mac's, marked "scheduled by
-lab", with run now, pause, resume, edit, delete and history working as for
-this Mac's. They keep running while the Mac sleeps or is off. If the machine
-can't be reached, a line at the top says so (with when it was last seen), its
-entries show as last known and their buttons do nothing until it's back. See [Scheduled by another machine](#scheduled-by-another-machine).
 
 ## What's in this repo
 
@@ -178,13 +175,13 @@ Each automation has three buttons:
 
 To change the order, drag an automation up or down by the dotted handle on its left.
 
-**Scheduled by another machine:** an automation that runs on a machine running
-automate-everything itself can be scheduled by that machine instead (**Scheduled
-by** in the edit form), so it fires while this Mac sleeps. They're in the same list, after this Mac's, marked "scheduled by
-<machine>", and refreshed every minute and right after you change one. A
-machine that can't be reached gets a line at the top, and its entries' buttons
-do nothing until it's back. A name scheduled by both this Mac and a machine
-fires from each, so the panel flags it: delete the one you don't want.
+**Runs on** in the edit form picks where an automation runs: this Mac and/or
+machines running automate-everything. Each of those fires its own copy, so it
+runs while this Mac sleeps. Its line shows where it runs (`This Mac + lab`) and
+its last run wherever that was; a machine that can't be reached, or hasn't got
+the latest copy yet, is said so under it. Automations a machine has in its own
+config show after this Mac's, marked "defined on lab", and a name defined in
+both places is flagged, since both fire.
 
 **History** lists every run, other machines' included. Click one to see what happened: when it ran, how
 long it took, its output and, for an agent, what was on its screen at the end.
@@ -253,6 +250,7 @@ Requirements: [docs/requirements.md](docs/requirements.md).
 |---|---|
 | Config | `~/.config/automate-everything/automations.toml` |
 | History, locks, logs | `~/.local/state/automate-everything/` (`runs/<id>/run.json`, `stdout.log`, `stderr.log`, `agent.log`) |
+| Copies other machines sent | `~/.local/state/automate-everything/received/<machine>.toml` (and `sent.json`: what this one sent) |
 | Background service | macOS: `~/Library/LaunchAgents/com.lucasprag.automate-everything.plist`; Linux: `$XDG_CONFIG_HOME/systemd/user/com.lucasprag.automate-everything.service` (default `~/.config`) |
 | Worktrees | `~/.herdr/worktrees/<repo>/automation/<name>/<stamp>` (on the run's machine) |
 
@@ -274,6 +272,7 @@ schedule = "30 8-15 * * 1-5"   # cron, 5 fields; @hourly/@daily/@weekly too
 timezone = "America/Toronto"   # default: this computer's
 grace_minutes = 10             # a fire missed by more than this is recorded as missed
 paused = false
+runs_on = ["local"]            # where: local and/or machines, each fires its own copy (default: local)
 command = "~/bin/hello --loud" # run by /bin/sh with your login environment
 cwd = "~/Projects"             # default: home
 timeout_seconds = 3600
@@ -300,56 +299,53 @@ Every run gets the environment variables `HERDR_AUTOMATION`,
 `HERDR_AUTOMATION_RUN_ID` and `HERDR_AUTOMATION_TRIGGER` (`scheduled` or
 `manual`).
 
-### Running on another machine
+### Running on other machines
 
-`machine` runs an entry on another herdr-core machine, one that
-`hc machine ls` lists. Its `command`, `cwd`, `repo`, `precheck` and
-`prompt_file` are paths on that machine, `~` being its home. Leave it out to
-run on this Mac.
+`runs_on` lists where an automation runs: `local` (this machine) and/or
+herdr-core machines (`hc machine ls`) that run automate-everything with its
+service. Each machine gets a copy of the automations meant for it and fires
+them with its own scheduler, so they run while this Mac sleeps or is off. You
+define and change them here; the copy can't be changed there.
 
 ```toml
 [automations.lab-probe]
 kind = "script"
 schedule = "*/30 * * * *"
-machine = "lab"                # default: this Mac
+runs_on = ["lab"]              # default: ["local"]; both: ["local", "lab"]
 command = "uname -a; hostname"
 ```
 
-### Scheduled by another machine
+- **Paths and environment are the machine's**: `command`, `cwd`, `repo`,
+  `precheck` and `prompt_file` resolve there, `~` being its home, with its own
+  login environment.
+- **Its runs and history stay on the machine.** The panel shows them with this
+  Mac's; from the terminal, `automate-everything --on lab history lab-probe`.
+- **Copies go out right after a change** (from the panel or the command line)
+  and the scheduler checks every minute, so hand edits follow within a
+  minute. A machine that's offline keeps running its last copy and gets the new
+  one when it's back. A machine only ever holds the whole current set, so
+  dropping it from `runs_on` removes its copy.
+- **An empty `timezone` means this Mac's**: it's written into the copy, so the
+  schedule means the same on every machine.
+- **Run now** runs it everywhere it runs; `run --wait` needs a single place
+  (add `--on lab` for one machine).
+- **A name in the machine's own config** wins over the copy; the copy shows as
+  invalid there until one of them goes.
 
-With `machine` set, this Mac's scheduler fires the run and the run executes on
-the machine, so nothing runs while this Mac sleeps. To have the machine keep
-the schedule itself, put the entry in *its* config instead: the machine needs
-automate-everything installed with its service running (see [On Linux, without
-the Herdr app](#on-linux-without-the-herdr-app)).
+`machine` is the other way to reach a machine, for one without
+automate-everything: this Mac fires the run and it executes there through hc,
+so nothing runs while this Mac sleeps. It goes with `runs_on` unset (or just
+`local`).
 
-From this Mac, `--on <machine>` runs any command there, through `hc exec`:
-
-```sh
-automate-everything --on lab set lab-probe --create --fields '{"kind":"script","schedule":"*/30 * * * *","command":"uname -a"}'
-automate-everything --on lab list
+```toml
+machine = "box"                # this Mac fires it, it runs on box
 ```
 
-On the machine it's an ordinary local entry: no `machine` field, paths, `~`
-and the environment are its own, and its runs and history stay there. An empty
-`timezone` means the machine's own, so the panel writes this Mac's in when you
-leave it empty.
-
-`transfer` moves an entry between the two schedulers. It creates the entry on
-the target paused, removes it from the source, then resumes it, so it never
-fires from both and is never in neither (if the removal fails, the copy is
-removed again). History stays where it was.
-
-```sh
-automate-everything transfer lab-probe --to lab          # lab schedules it from now on
-automate-everything --on lab transfer lab-probe --to here   # back to this Mac (machine = "lab")
-```
-
-`--on` needs the same release on both sides (`machines --probe` shows each
-machine's version), and it never waits on an offline machine: one hc doesn't
-show as connected fails at once, and calls time out after 10 s (30 s for
-changes). A field the machine's version doesn't know is refused there, and
-nothing is written.
+`--on <machine>` runs any command against a machine's own config and history
+(`hc exec`). It never waits on an offline machine: one hc doesn't show as
+connected fails at once, and calls time out after 10 s (30 s for changes). The
+machine needs a release that receives copies; `machines --probe` shows each
+one's version.
 
 ## How runs behave, in detail
 
@@ -385,8 +381,8 @@ nothing is written.
   this Mac's. A script's output comes back into its record as usual, and a
   timeout stops it there. An agent's space shows under that machine. If the
   machine can't be reached, the run fails and says so. Scheduling stays on
-  this Mac, so nothing runs while it sleeps, unless the machine schedules it
-  itself ([Scheduled by another machine](#scheduled-by-another-machine)).
+  this Mac, so nothing runs while it sleeps; list the machine in `runs_on`
+  instead to have it fire its own copy ([Running on other machines](#running-on-other-machines)).
 - **Catching up after sleep:** the newest missed time runs once if it's inside
   the grace window; otherwise one missed record covers them all. Daylight
   saving: a fixed-time automation runs once when clocks go back and isn't lost
@@ -400,7 +396,6 @@ automate-everything move <name> --to <position>
 automate-everything history [<name>] | show <run-id>
 automate-everything get <name> | set <name> --fields '<json>' [--create] | check
 automate-everything status | machines [--probe] | service install|uninstall|restart | scheduler
-automate-everything transfer <name> --to <machine>|here
 automate-everything --on <machine> <any of the above>
 ```
 

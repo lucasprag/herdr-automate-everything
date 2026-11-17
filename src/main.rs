@@ -118,7 +118,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
         /// Also ask each connected one whether it runs automate-everything
-        /// (version, scheduler) so entries can be scheduled by it
+        /// (version, scheduler), so automations can run there (runs_on)
         #[arg(long)]
         probe: bool,
     },

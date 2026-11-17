@@ -109,6 +109,8 @@ export class Panel {
           const [items, st] = await Promise.all([cli.list(), cli.status()]);
           this.items = items;
           this.scheduler = st;
+          // How this Mac names itself to the machines it sends copies to.
+          this.source = st.source_id ?? null;
           if (this.page !== "home") this.runs = await cli.history();
           if (this.page === "run" && this.detail && !this.detail.on) this.detail = await cli.show(this.detail.id);
           this.error = null;
@@ -121,7 +123,11 @@ export class Panel {
     });
   }
 
-  // ---- machines that schedule entries themselves ------------------------
+  // ---- other machines ------------------------------------------------
+  // An automation defined here can run on machines running automate-everything
+  // (`runs_on`): each gets a copy and fires it itself. The panel shows one
+  // line per automation defined here, with its copies' state folded in, plus
+  // the automations a machine has in its own config ("defined on lab").
 
   // Which machines run automate-everything (the CLI remembers ones seen
   // before, so an offline one still shows, as unreachable).
@@ -131,8 +137,10 @@ export class Panel {
       try {
         ms = await cli.machines(true);
       } catch {
+        this.discovered = true;
         return; // no hc: this Mac only
       }
+      this.discovered = true;
       const found = new Set();
       for (const m of ms) {
         const ae = m.automate_everything;
@@ -191,9 +199,36 @@ export class Panel {
     });
   }
 
-  // Every entry on screen: this Mac's, then each machine's.
+  // Every line on screen: this Mac's automations, then those another machine
+  // defines itself (not the copies this Mac sent it).
   allItems() {
-    return [...(this.items ?? []), ...[...this.remotes.values()].flatMap((r) => r.items ?? [])];
+    return [...(this.items ?? []), ...this.foreign()];
+  }
+
+  foreign() {
+    return [...this.remotes.values()].flatMap((r) => (r.items ?? []).filter((i) => !this.isCopy(i)));
+  }
+
+  isCopy(i) {
+    return Boolean(i.origin && i.origin === this.source);
+  }
+
+  // Where an automation defined here runs, each with its state there:
+  // { place: "local" | machine, item (that place's list entry), problem }.
+  placesOf(item) {
+    return (item.runs_on ?? ["local"]).map((place) => {
+      if (place === "local") return { place, item };
+      const r = this.remotes.get(place);
+      const copy = r?.items?.find((i) => i.name === item.name && this.isCopy(i));
+      const problem = !this.discovered ? null : !r
+        ? `${place} doesn't run automate-everything, so it can't run this`
+        : r.outdated
+          ? `automate-everything on ${place} is too old to run this: update it there`
+          : r.reachable === false
+            ? `${place} is unreachable: it runs this from the last copy it got`
+            : r.items && !copy ? `Not on ${place} yet: it's sent within a minute` : null;
+      return { place, item: copy ?? null, problem };
+    });
   }
 
   // This Mac's runs and every machine's, newest first.
@@ -335,7 +370,7 @@ export class Panel {
   // Run, pause or resume one automation; the list follows the files changing.
   // On another machine's entry (`on`), that machine is asked again right
   // away and once more a few seconds later, when a run has its record.
-  act(name, fn, cx, on = null) {
+  act(name, fn, cx, on = null, also = []) {
     const key = on ? `${name}@${on}` : name;
     this.acting ??= new Set();
     if (this.acting.has(key)) return;
@@ -348,9 +383,13 @@ export class Panel {
         this.actionError = `${on ? `${name} on ${on}` : name}: ${String(e?.message ?? e)}`;
       }
       this.acting.delete(key);
-      if (!on) return this.refresh(cx);
-      this.refreshRemote(on, cx);
-      cx.timer.after(3000, (cx) => this.refreshRemote(on, cx));
+      if (!on) this.refresh(cx);
+      // The machines it runs on (or the one that defines it): now, and again
+      // once a run there has its record (or a copy has gone out).
+      for (const m of new Set([on, ...also].filter(Boolean))) {
+        this.refreshRemote(m, cx);
+        cx.timer.after(3000, (cx) => this.refreshRemote(m, cx));
+      }
     });
   }
 
@@ -359,12 +398,23 @@ export class Panel {
     // Another machine's entry while it can't be reached: shown as last known, inert.
     const offline = Boolean(on && this.remotes.get(on)?.reachable === false);
     const key = on ? `${item.name}@${on}` : item.name;
-    const status = this.statusOf(item);
-    const last = item.last;
-    const lastText = last ? `${word(last.status)} ${ago(when(last))}` : "never ran";
+    // Defined here: its state wherever it runs, folded into one line.
+    const places = on ? [] : this.placesOf(item);
+    const machines = places.map((p) => p.place).filter((p) => p !== "local");
+    const states = [item, ...places.filter((p) => p.place !== "local").map((p) => p.item).filter(Boolean)];
+    const running = states.some((i) => i.status === "running");
+    const status = running ? "running" : this.statusOf(item);
+    // The newest last run, wherever it was.
+    const lasts = states.map((i) => i.last && { ...i.last, at: i.on }).filter(Boolean);
+    const last = lasts.sort((a, b) => Date.parse(when(b)) - Date.parse(when(a)))[0];
+    const lastText = last ? `${word(last.status)} ${ago(when(last))}${last.at && machines.length ? ` on ${last.at}` : ""}` : "never ran";
     const next = item.next && status !== "paused" ? `next ${clock(item.next)}` : "";
     const dragged = Boolean(!on && this.drag?.moved && this.drag.name === item.name);
-    const where = on ? ` · scheduled by ${on}` : item.machine ? ` on ${item.machine}` : "";
+    const label = (p) => (p === "local" ? "This Mac" : p);
+    const where = on
+      ? ` · defined on ${on}`
+      : item.machine ? ` on ${item.machine}` : machines.length ? ` · ${places.map((p) => label(p.place)).join(" + ")}` : "";
+    const problems = places.map((p) => p.problem).filter(Boolean);
     const others = item.status === "invalid" ? [] : (this.twins().get(item.name) ?? []).filter((w) => w !== (on ?? "this Mac"));
     return v_flex().id(`ae-item-${key}`).pl(6).pr(16).py(8).gap(3).flex_none()
       .when(offline, (el) => el.opacity(0.55))
@@ -386,11 +436,11 @@ export class Panel {
         .child(div().flex_none().text_size(11.5).text_color(t.dim).child(next))
         .children(status === "invalid" ? [] : [
           this.rowButton(t, `ae-run-now-${key}`, "play.svg", 11,
-            status === "running" ? "Running" : on ? `Run now on ${on}` : "Run now",
-            status === "running" || offline ? null : (cx) => this.act(item.name, () => cli.runNow(item.name, on), cx, on)),
+            status === "running" ? "Running" : on ? `Run now on ${on}` : places.length > 1 ? `Run now on ${places.map((p) => label(p.place)).join(" and ")}` : machines.length ? `Run now on ${machines[0]}` : "Run now",
+            status === "running" || offline ? null : (cx) => this.act(item.name, () => cli.runNow(item.name, on), cx, on, machines)),
           this.rowButton(t, `ae-pause-${key}`, "pause.svg", 11,
             item.paused ? "Paused: click to resume" : "Pause",
-            offline ? null : (cx) => this.act(item.name, () => (item.paused ? cli.resume : cli.pause)(item.name, on), cx, on),
+            offline ? null : (cx) => this.act(item.name, () => (item.paused ? cli.resume : cli.pause)(item.name, on), cx, on, machines),
             { on: item.paused }),
         ])
         .child(this.rowButton(t, `ae-more-${key}`, "dots.svg", 14, "Edit or delete",
@@ -400,8 +450,11 @@ export class Panel {
         .child(div().flex_none().text_color(t.dim).child(`· ${item.kind ?? "?"}${where} ·`))
         .child(div().flex_1().min_w(0).truncate().text_color(last ? tone(t, last.status) : t.dim).child(lastText)))
       .when(Boolean(item.error), (el) => el.child(div().pl(36).text_size(11.5).text_color(t.blocked).child(item.error)))
+      .children(problems.map((p) => div().pl(36).text_size(11.5).text_color(t.blocked).child(p)))
       .when(others.length > 0, (el) => el.child(div().pl(36).text_size(11.5).text_color(t.blocked)
-        .child(`Also scheduled by ${others.join(", ")}: it fires from each. Delete the one you don't want.`)));
+        .child(on
+          ? `Also defined on this Mac: both fire. Delete the one you don't want.`
+          : `Also defined on ${others.join(", ")}: both fire. Delete the one you don't want.`)));
   }
 
   // A line about a machine whose entries are in the list, only when
@@ -446,10 +499,10 @@ export class Panel {
           cx.notify();
         }
       })
-      // One list: this Mac's entries (reorderable), then those other machines schedule.
+      // One list: the automations defined here (reorderable), then those a machine defines itself.
       .children(this.remoteNotices(t))
       .children(this.ordered().map((i) => this.itemRow(t, i)))
-      .children([...this.remotes.values()].flatMap((r) => (r.items ?? []).map((i) => this.itemRow(t, i))));
+      .children(this.foreign().map((i) => this.itemRow(t, i)));
   }
 
   // ---- dragging to reorder ---------------------------------------------
@@ -514,7 +567,7 @@ export class Panel {
   // ---- history ----------------------------------------------------------
 
   runRow(t, r) {
-    const bits = [r.trigger, r.kind, r.machine ? `on ${r.machine}` : r.on && `on ${r.on}`, r.on && `by ${r.on}`];
+    const bits = [r.trigger, r.kind, r.machine ? `on ${r.machine}` : r.on && `on ${r.on}`];
     if (r.duration_ms != null) bits.push(duration(r.duration_ms));
     if (r.missed_fires > 1) bits.push(`${r.missed_fires} fires`);
     if (r.caught_up) bits.push(`caught up ${r.caught_up}`);
@@ -572,7 +625,7 @@ export class Panel {
         this.field(t, "Status", word(r.status), tone(t, r.status)),
         this.field(t, "Trigger", r.trigger),
         this.field(t, "Machine", r.machine ?? r.on),
-        this.field(t, "Scheduled by", r.on),
+
         this.field(t, "Scheduled", r.scheduled_for && new Date(r.scheduled_for).toLocaleString()),
         this.field(t, "Missed", r.missed_fires && `${r.missed_fires} fire(s), from ${new Date(r.first_missed).toLocaleString()}`),
         this.field(t, "Caught up", r.caught_up && `${r.caught_up} earlier fire(s)`),

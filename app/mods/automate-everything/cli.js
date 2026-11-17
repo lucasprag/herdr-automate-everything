@@ -45,11 +45,7 @@ export const remove = (name, on) => call(at(on, ["delete", name, "--yes"]));
 export const move = (name, to, on) => call(at(on, ["move", name, "--to", String(to)]));
 export const save = (name, fields, create, on) =>
   call(at(on, ["set", name, "--fields", JSON.stringify(fields), ...(create ? ["--create"] : [])]));
-// Hands the entry from `on` (null: this Mac) to `to` (a machine, or "here").
-export const transfer = (name, to, fields, on) =>
-  call(at(on, ["transfer", name, "--to", to, ...(fields ? ["--fields", JSON.stringify(fields)] : [])]));
-
-// Machines that can schedule entries: running automate-everything new enough
-// for `--on`.
-export const PROTOCOL = 1;
+// Machines that can run automations defined here (`runs_on`): running
+// automate-everything new enough to receive copies.
+export const PROTOCOL = 2;
 export const schedulers = (ms) => ms.filter((m) => m.automate_everything?.installed && (m.automate_everything.protocol ?? 0) >= PROTOCOL);

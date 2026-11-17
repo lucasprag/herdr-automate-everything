@@ -2,10 +2,12 @@
 // set`, which validates and rewrites only that entry; anything invalid comes
 // back as an error here and nothing is written.
 //
-// An entry runs on this Mac or a machine ("Runs on"); one that runs on a
-// machine can also be scheduled by it ("Scheduled by"), so it fires while this
-// Mac sleeps. Such an entry lives in that machine's config (`--on`), and
-// changing who schedules it is a `transfer`.
+// "Runs on" picks where: this Mac and/or machines running automate-everything
+// (`runs_on`), each of which gets a copy and fires it itself, even while this
+// Mac sleeps. A machine without automate-everything can still be picked on its
+// own: this Mac fires the run and it executes there through hc (`machine`).
+// An automation a machine defines itself is edited there (`--on`), without
+// "Runs on".
 
 import { div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea } from "gpui-base";
@@ -54,9 +56,11 @@ export class Edit {
     this.error = null;
     this.saving = false;
     this.loaded = this.creating;
-    // scheduler: the machine whose scheduler holds it; null for this Mac.
+    // A machine's own automation, edited there; null for one defined here.
     this.from = p.on ?? null;
-    this.choice = { kind: "script", directory: "repo", space: "per-run", machine: null, scheduler: this.from };
+    // places: where it runs ("local" and/or machines); via: a machine without
+    // automate-everything this Mac runs it on through hc.
+    this.choice = { kind: "script", directory: "repo", space: "per-run", places: ["local"], via: null };
     // hc's machines, for the picker; [] until known (or when hc has none).
     this.machines = [];
     this.handle = cx.focus_handle();
@@ -74,6 +78,7 @@ export class Edit {
     cx.spawn(async (cx) => {
       try {
         this.machines = await cli.machines(true);
+        this.upgrade();
       } catch {}
       cx.notify();
     });
@@ -87,11 +92,12 @@ export class Edit {
         this.choice.kind = entry.kind ?? "script";
         this.choice.directory = entry.directory ?? "repo";
         this.choice.space = entry.space ?? "per-run";
-        // On its machine's side an entry it runs itself has no `machine`.
-        this.choice.machine = entry.machine ?? this.from;
+        this.choice.places = entry.runs_on ?? ["local"];
+        this.choice.via = entry.machine ?? null;
         for (const [key] of FIELDS) this.inputs[key].set_value(toText(key, entry[key]));
         // What the form shows now, so Save sends only what changed.
-        try { this.original = this.fields(this.from); } catch { this.original = {}; }
+        try { this.original = this.fields(); } catch { this.original = {}; }
+        this.upgrade();
         this.loaded = true;
       } catch (e) {
         this.error = String(e?.message ?? e);
@@ -102,6 +108,14 @@ export class Edit {
 
   close() { closeOverlay(props().overlay); }
 
+  // An entry this Mac runs on a machine (`machine`) that now runs
+  // automate-everything itself: offered as running there, fired by that
+  // machine, so it runs while this Mac sleeps. Saving makes it so.
+  upgrade() {
+    const v = this.choice.via;
+    if (v && this.capable(v)) Object.assign(this.choice, { via: null, places: [v] });
+  }
+
   shown(scope) {
     if (scope === "all") return true;
     if (scope === "worktree") return this.choice.kind === "agent" && this.choice.directory === "worktree";
@@ -109,11 +123,14 @@ export class Edit {
   }
 
   // The fields to send: every field, null where empty or not for this kind,
-  // so `set` removes what was cleared. `machine` is as `scheduler` sees it:
-  // none when it runs on the machine that schedules it.
-  fields(scheduler = this.choice.scheduler) {
-    const m = this.choice.machine ?? null;
-    const out = { kind: this.choice.kind, machine: m === scheduler ? null : m };
+  // so `set` removes what was cleared.
+  fields() {
+    const out = { kind: this.choice.kind };
+    if (!this.from) {
+      const places = this.choice.places;
+      out.runs_on = places.length === 1 && places[0] === "local" ? null : places;
+      out.machine = this.choice.via ?? null;
+    }
     const agent = this.choice.kind === "agent";
     out.directory = agent && this.choice.directory === "worktree" ? "worktree" : null;
     out.space = agent && this.choice.space === "shared" ? "shared" : null;
@@ -145,31 +162,18 @@ export class Edit {
     return out;
   }
 
-  // This Mac's zone, written into an entry another machine schedules when
-  // it has none: an empty timezone means the scheduler's own.
-  async localZone() {
-    try {
-      const tz = (await cli.status()).timezone;
-      if (tz) return tz;
-    } catch {}
-    return Intl.DateTimeFormat().resolvedOptions().timeZone;
-  }
-
   save(cx) {
     if (this.saving || !this.loaded) return;
-    const to = this.choice.scheduler ?? null;
-    const moving = !this.creating && to !== this.from;
     let name, fields;
     try {
       name = this.creating ? this.nameInput.value().trim() : props().name;
       if (!name) throw new Error("Give it a name");
-      // Changes are sent as the entry's current scheduler sees them.
-      fields = this.fields(this.creating ? to : this.from);
+      fields = this.fields();
       if (this.original) {
         for (const k of Object.keys(fields)) {
           if (JSON.stringify(fields[k]) === JSON.stringify(this.original[k])) delete fields[k];
         }
-        if (!Object.keys(fields).length && !moving) return this.close();
+        if (!Object.keys(fields).length) return this.close();
       }
     } catch (e) {
       this.error = String(e?.message ?? e);
@@ -181,20 +185,11 @@ export class Edit {
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        if (this.creating) {
-          if (to && !fields.timezone) fields.timezone = await this.localZone();
-          await cli.save(name, fields, true, to);
-        } else if (!moving) {
-          await cli.save(name, fields, false, this.from);
-        } else {
-          // Back here from a machine, an entry runs there unless Runs on says otherwise.
-          const runsOn = this.choice.machine ?? null;
-          if (!to) delete fields.machine;
-          await cli.transfer(name, to ?? "here", Object.keys(fields).length ? fields : null, this.from);
-          if (!to && runsOn !== this.from) await cli.save(name, { machine: runsOn }, false, null);
-        }
-        // The panel only hears about this Mac's files; tell it about another machine's.
-        for (const m of new Set([this.from, to])) if (m) run(`automate-everything.refresh:${m}`);
+        await cli.save(name, fields, this.creating, this.from);
+        // The panel only hears about this Mac's files; tell it about the
+        // machines that got (or lost) a copy, or the one that defines it.
+        const machines = new Set([this.from, ...this.choice.places, ...(this.original?.runs_on ?? [])]);
+        for (const m of machines) if (m && m !== "local") run(`automate-everything.refresh:${m}`);
         this.close();
       } catch (e) {
         this.error = String(e?.message ?? e);
@@ -214,45 +209,71 @@ export class Edit {
         .hover((s) => s.text_color(t.foreground))
         .on_click((_e, cx) => {
           this.choice[key] = value;
-          // Only the machine it runs on can schedule it.
-          if (key === "machine" && this.choice.scheduler && this.choice.scheduler !== value) this.choice.scheduler = null;
           cx.notify();
         })
         .child(label);
     }));
   }
 
-  // "This Mac", then each hc machine (with its state when not connected),
-  // plus the entry's own machine if hc doesn't list it (any more).
-  machinePicker(t) {
-    const options = [[null, "This Mac"]];
-    for (const m of this.machines) {
-      options.push([m.name, m.state && m.state !== "connected" ? `${m.name} (${m.state})` : m.name]);
+  // Whether `machine` runs automate-everything new enough to fire its own copy.
+  capable(machine) {
+    return cli.schedulers(this.machines).some((m) => m.name === machine);
+  }
+
+  // Clicking a place: This Mac and capable machines toggle (at least one
+  // stays on); a machine without automate-everything is on its own (this Mac
+  // runs it there).
+  toggle(place) {
+    const c = this.choice;
+    if (place !== "local" && !this.capable(place)) {
+      Object.assign(c, c.via === place ? { via: null, places: ["local"] } : { via: place, places: ["local"] });
+      return;
     }
-    const cur = this.choice.machine;
-    if (cur && !this.machines.some((m) => m.name === cur)) options.push([cur, `${cur} (unknown)`]);
-    const picker = this.segmented(t, "machine", options);
-    if (!cur) return picker;
-    return v_flex().gap(4).child(picker)
-      .child(div().text_size(11).text_color(t.dim)
-        .child(`Paths and ~ are on ${cur}.`));
+    if (c.via) {
+      c.via = null;
+      c.places = place === "local" ? ["local"] : [place];
+      return;
+    }
+    const next = c.places.includes(place) ? c.places.filter((p) => p !== place) : [...c.places, place];
+    if (!next.length) return;
+    // This Mac first, then machines in hc's order.
+    const order = ["local", ...this.machines.map((m) => m.name)];
+    c.places = next.sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99));
   }
 
-  // Whether `machine` can keep the schedule itself: it runs a new enough
-  // automate-everything (or already holds this entry).
-  canSchedule(machine) {
-    if (!machine) return false;
-    if (machine === this.from) return true;
-    return cli.schedulers(this.machines).some((m) => m.name === machine && m.automate_everything.reachable !== false);
-  }
-
-  schedulerPicker(t) {
-    const m = this.choice.machine;
-    const picker = this.segmented(t, "scheduler", [[null, "This Mac · needs it awake"], [m, `${m} · runs while this Mac sleeps`]]);
-    const note = this.choice.scheduler
-      ? `${m}'s own scheduler fires it, even with this Mac asleep or off. Its runs and history stay on ${m}.`
-      : `This Mac fires it and waits for it: nothing runs while this Mac sleeps.`;
-    return v_flex().gap(4).child(picker).child(div().text_size(11).text_color(t.dim).child(note));
+  // "This Mac", then each hc machine (with its state when not connected),
+  // plus any the entry names that hc doesn't list (any more).
+  placePicker(t) {
+    const c = this.choice;
+    const names = this.machines.map((m) => m.name);
+    for (const p of [...c.places, c.via]) if (p && p !== "local" && !names.includes(p)) names.push(p);
+    const options = [["local", "This Mac"], ...names.map((n) => {
+      const m = this.machines.find((x) => x.name === n);
+      const state = !m ? "unknown" : m.state !== "connected" ? m.state : null;
+      return [n, state ? `${n} (${state})` : n];
+    })];
+    const on = (p) => (c.via ? p === c.via : c.places.includes(p));
+    const chips = h_flex().gap(0).children(options.map(([value, label]) => h_flex().id(`place-${value}`).h(30).px(12)
+      .items_center().cursor_pointer()
+      .border_1().border_color(on(value) ? t.accent : t.input).bg(on(value) ? t.selected : t.background)
+      .text_size(12).text_color(on(value) ? t.foreground : t.muted)
+      .hover((s) => s.text_color(t.foreground))
+      .on_click((_e, cx) => { this.toggle(value); cx.notify(); })
+      .child(label)));
+    const machines = c.places.filter((p) => p !== "local");
+    const note = c.via
+      ? `This Mac fires it and runs it on ${c.via} through hc (${c.via} has no automate-everything): nothing runs while this Mac sleeps. Paths and ~ are on ${c.via}.`
+      : machines.length
+        ? (() => {
+          const many = machines.length > 1;
+          const who = `${machines.join(" and ")} ${many ? "each fire" : "fires"}`;
+          const what = c.places.includes("local")
+            ? `This Mac fires it, and ${who} ${many ? "their" : "its"} own copy`
+            : `${who} it with ${many ? "their" : "its"} own scheduler`;
+          return `${what}, even while this Mac sleeps. Paths and ~ are on the machine it runs on.`;
+        })()
+        : null;
+    return note ? v_flex().gap(4).child(chips).child(div().text_size(11).text_color(t.dim).child(note)) : chips;
   }
 
   row(t, label, control) {
@@ -280,8 +301,8 @@ export class Edit {
     if (this.creating) rows.push(this.row(t, "Name", h_flex().id("f-name").h(34).px(10).items_center().border_1().border_color(t.input).bg(t.background)
       .on_click(() => this.nameInput.focus()).child(Input.new(this.nameInput).flex_1().h_full().text_size(12.5).text_color(t.foreground))));
     rows.push(this.row(t, "Kind", this.segmented(t, "kind")));
-    if (this.machines.length || this.choice.machine) rows.push(this.row(t, "Runs on", this.machinePicker(t)));
-    if (this.canSchedule(this.choice.machine)) rows.push(this.row(t, "Scheduled by", this.schedulerPicker(t)));
+    const elsewhere = this.choice.via || this.choice.places.some((p) => p !== "local");
+    if (!this.from && (this.machines.length || elsewhere)) rows.push(this.row(t, "Runs on", this.placePicker(t)));
     for (const [key, label, , scope] of FIELDS) {
       if (key === "repo" && this.shown("agent")) {
         rows.push(this.row(t, label, this.input(t, key)));
@@ -305,7 +326,7 @@ export class Edit {
         cx.stop_propagation();
       })
       .child(h_flex().px(18).pt(16).pb(10).items_center()
-        .child(div().flex_1().text_size(15).font_semibold().text_color(t.foreground).child(this.creating ? "New automation" : this.from ? `Edit ${p.name} on ${this.from}` : `Edit ${p.name}`))
+        .child(div().flex_1().text_size(15).font_semibold().text_color(t.foreground).child(this.creating ? "New automation" : this.from ? `Edit ${p.name} (defined on ${this.from})` : `Edit ${p.name}`))
         .child(div().text_size(11).text_color(t.dim).child("Cmd+Enter: save · Esc")))
       .child(v_flex().id("ae-edit-fields").flex_1().min_h(0).overflow_y_scrollbar().px(18).pb(12).gap(12)
         .children(this.loaded ? rows : [div().text_color(t.dim).child(this.error ? "" : "Loading…")]))

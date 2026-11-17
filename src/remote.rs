@@ -1,7 +1,6 @@
 //! `--on <machine>`: the same command, answered by automate-everything on
 //! another herdr-core machine (through `hc exec`), against that machine's own
-//! config, history and scheduler. An entry there is scheduled by that machine
-//! and fires while this one sleeps.
+//! config, history and scheduler.
 //!
 //! Never hangs: a machine hc doesn't show as connected fails at once, and
 //! every call has a short timeout.
