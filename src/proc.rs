@@ -81,10 +81,7 @@ fn split_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
 
 /// Runs to completion with stdout and stderr going to files.
 pub fn run_to_files(mut cmd: Command, stdout: &Path, stderr: &Path, timeout: Duration) -> std::io::Result<Outcome> {
-    cmd.stdin(Stdio::null())
-        .stdout(File::create(stdout)?)
-        .stderr(File::create(stderr)?)
-;
+    cmd.stdin(Stdio::null()).stdout(File::create(stdout)?).stderr(File::create(stderr)?);
     own_session(&mut cmd);
     let mut child = cmd.spawn()?;
     let (status, timed_out) = wait_with_timeout(&mut child, timeout)?;

@@ -34,8 +34,34 @@ fn sent_file() -> PathBuf {
     paths::state_dir().join("sent.json")
 }
 
-/// This machine, as it names itself to the machines it sends copies to.
+/// This machine, as it names itself to the machines it sends copies to: its
+/// short hostname, for people, plus a random tag made once and kept in the
+/// state folder, so two machines with the same name never overwrite each
+/// other's copies.
 pub fn source_id() -> String {
+    format!("{}-{}", hostname_id(), tag())
+}
+
+fn tag() -> String {
+    let path = paths::state_dir().join("id");
+    if let Ok(t) = std::fs::read_to_string(&path) {
+        let t = t.trim();
+        if t.len() == 8 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+            return t.to_string();
+        }
+    }
+    let mut bytes = [0u8; 4];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut bytes);
+    }
+    let t: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let _ = paths::ensure_state_dirs();
+    let _ = std::fs::write(&path, &t);
+    t
+}
+
+fn hostname_id() -> String {
     let mut buf = [0u8; 256];
     let raw = unsafe {
         if libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) == 0 {
@@ -173,17 +199,21 @@ pub struct Outcome {
 /// which removes the last one. Nothing to do (no `runs_on` anywhere, nothing
 /// sent before) costs no hc call.
 pub fn send() -> Result<Vec<Outcome>> {
-    let mut sent = load_sent();
-    let copies = copies(&config::read_text()?, cron::system_tz().name())?;
-    if copies.is_empty() && sent.is_empty() {
+    let tz = cron::system_tz().name();
+    // Without the lock first, so the common case (nothing elsewhere) is cheap.
+    if copies(&config::read_text()?, tz)?.is_empty() && load_sent().is_empty() {
         return Ok(Vec::new());
     }
     paths::ensure_state_dirs()?;
     let _lock = FileLock::acquire(&paths::state_dir().join("sync.lock"))?;
-    // Read again under the lock: another send may have just finished.
-    sent = load_sent();
+    // Both read under the lock, so a send that waited for another never
+    // sends an older config than the one that went before it.
+    let copies = copies(&config::read_text()?, tz)?;
+    let mut sent = load_sent();
+    // hc's machines, asked once for every send.
+    let listed = crate::hc::machines().map_err(|e| format!("{e:#}"));
     // A machine removed from hc that no entry runs on any more: nothing to send.
-    if let Ok(known) = crate::hc::machines() {
+    if let Ok(known) = &listed {
         let known: Vec<&str> = known.iter().filter_map(|m| m["name"].as_str()).collect();
         sent.retain(|m, _| copies.contains_key(m) || known.contains(&m.as_str()));
     }
@@ -200,7 +230,11 @@ pub fn send() -> Result<Vec<Outcome>> {
             out.push(Outcome { machine: m, result: None });
             continue;
         }
-        let result = send_one(&m, &source, &text);
+        let result = listed
+            .as_ref()
+            .map_err(|e| anyhow!("{e}"))
+            .and_then(|l| remote::reachable_in(l, &m))
+            .and_then(|_| send_one(&m, &source, &text));
         match &result {
             Ok(_) if text.is_empty() => {
                 sent.remove(&m);
@@ -219,7 +253,6 @@ pub fn send() -> Result<Vec<Outcome>> {
 }
 
 fn send_one(machine: &str, source: &str, text: &str) -> Result<usize> {
-    remote::reachable(machine)?;
     let args: Vec<String> =
         ["_sync-in", "--from", source, "--toml", text].iter().map(|s| s.to_string()).collect();
     let o = remote::call(machine, &args)?;

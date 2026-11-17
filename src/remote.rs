@@ -71,7 +71,11 @@ pub fn strip_on(args: impl IntoIterator<Item = String>, machine: &str) -> Vec<St
 /// Errs unless hc knows `machine` and shows it connected: what keeps an
 /// offline machine from costing a timeout.
 pub fn reachable(machine: &str) -> Result<()> {
-    let machines = hc::machines()?;
+    reachable_in(&hc::machines()?, machine)
+}
+
+/// `reachable`, against a `hc machine ls` already in hand.
+pub fn reachable_in(machines: &[Value], machine: &str) -> Result<()> {
     let Some(m) = machines.iter().find(|m| m["name"].as_str() == Some(machine)) else {
         let known: Vec<&str> = machines.iter().filter_map(|m| m["name"].as_str()).collect();
         bail!("unknown machine `{machine}` (known: {})", if known.is_empty() { "none".into() } else { known.join(", ") });

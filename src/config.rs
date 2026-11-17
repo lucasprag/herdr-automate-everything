@@ -439,11 +439,15 @@ pub fn load() -> Result<Config> {
             }
         };
         for mut slot in theirs.slots {
-            if cfg.find(slot.name()).is_some() {
-                // This machine's own entry wins; the copy shows why it doesn't run.
+            if let Some(other) = cfg.find(slot.name()) {
+                // This machine's own entry (or the first copy) wins; this one shows why it doesn't run.
                 let name = slot.name().to_string();
+                let error = match other.origin() {
+                    None => format!("this machine's own config also has `{name}`: remove one of them"),
+                    Some(o) => format!("`{o}` also sends `{name}`: remove it from one of them"),
+                };
                 slot = Slot::Invalid(Invalid {
-                    error: format!("this machine's own config also has `{name}`: remove one of them"),
+                    error,
                     name,
                     kind: None,
                     schedule: None,

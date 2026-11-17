@@ -331,8 +331,14 @@ fn run_now(name: &str, wait: bool, json_out: bool, run_id: Option<String>, check
             let _ = child.try_wait();
             runs.push(json!({ "on": null, "run_id": req.run_id }));
         }
+        // Asked once for all of them.
+        let listed = hc::machines();
         for m in machines {
-            match remote::reachable(m).and_then(|_| remote::start_run(m, name)) {
+            let ready = match &listed {
+                Ok(l) => remote::reachable_in(l, m),
+                Err(e) => Err(anyhow!("{e:#}")),
+            };
+            match ready.and_then(|_| remote::start_run(m, name)) {
                 Ok(id) => runs.push(json!({ "on": m, "run_id": id })),
                 Err(e) => errors.push(format!("{m}: {e:#}")),
             }
