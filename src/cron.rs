@@ -186,7 +186,9 @@ pub fn floor_minute(t: DateTime<Utc>) -> DateTime<Utc> {
     t.with_second(0).unwrap().with_nanosecond(0).unwrap()
 }
 
-/// The system zone, from `/etc/localtime`, else `$TZ`, else UTC.
+/// The system zone: `$TZ`, else the `/etc/localtime` link, else
+/// `/etc/timezone` (Debian and Ubuntu), else, on Linux, what `timedatectl`
+/// says (for an `/etc/localtime` that's a copy, not a link), else UTC.
 pub fn system_tz() -> Tz {
     if let Ok(tz) = std::env::var("TZ") {
         if let Ok(z) = tz.trim_start_matches(':').parse::<Tz>() {
@@ -201,7 +203,31 @@ pub fn system_tz() -> Tz {
             }
         }
     }
+    if let Ok(name) = std::fs::read_to_string("/etc/timezone") {
+        if let Ok(z) = name.trim().parse::<Tz>() {
+            return z;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(z) = timedatectl_tz() {
+        return z;
+    }
     Tz::UTC
+}
+
+/// The zone systemd-timedated reports, asked once per process: config loads
+/// call `system_tz` every minute.
+#[cfg(target_os = "linux")]
+fn timedatectl_tz() -> Option<Tz> {
+    static TZ: std::sync::OnceLock<Option<Tz>> = std::sync::OnceLock::new();
+    *TZ.get_or_init(|| {
+        let out = std::process::Command::new("timedatectl")
+            .args(["show", "--property=Timezone", "--value"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse::<Tz>().ok()
+    })
 }
 
 #[cfg(test)]

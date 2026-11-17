@@ -1,4 +1,5 @@
-//! The scheduler: one process (a launchd agent), held to one by a kernel lock.
+//! The scheduler: one process (a launchd agent on macOS, a systemd user
+//! service on Linux), held to one by a kernel lock.
 //! Every minute it finds the fires each automation had since it last looked,
 //! starts a run for the newest one if it's inside the grace window, and
 //! records `missed` otherwise. Runs are separate processes, so restarting the
@@ -44,7 +45,7 @@ fn save_cursors(c: &Cursors) {
 }
 
 fn exe_identity() -> Option<(u64, i64)> {
-    let exe = std::env::current_exe().ok()?;
+    let exe = paths::current_exe().ok()?;
     let m = std::fs::metadata(exe).ok()?;
     Some((m.ino(), m.mtime()))
 }
@@ -196,11 +197,11 @@ pub fn serve() -> Result<()> {
         // close-on-exec, so the new image takes the lock again.
         if exe_identity() != exe {
             log("binary changed; restarting as the new one");
-            let err = match std::env::current_exe() {
+            let err = match paths::current_exe() {
                 Ok(path) => Command::new(path).args(std::env::args_os().skip(1)).exec(),
                 Err(e) => e,
             };
-            log(&format!("couldn't restart as the new binary ({err}); exiting so launchd starts it"));
+            log(&format!("couldn't restart as the new binary ({err}); exiting so the service manager starts it"));
             return Ok(());
         }
 

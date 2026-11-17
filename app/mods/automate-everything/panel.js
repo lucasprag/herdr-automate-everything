@@ -32,7 +32,7 @@ export class Panel {
     this.heights = new Map(); // row heights by name, for working out where a drag lands
     this.noClickUntil = 0;
     // Self-install: download (or build) the binary, put it in ~/.local/bin,
-    // keep the launchd agent running. Cheap when nothing changed.
+    // keep the background service (launchd/systemd) running. Cheap when nothing changed.
     this.selfInstall(cx);
     cx.timer.every(INSTALL_MS, (cx) => this.selfInstall(cx));
     this.refresh(cx);

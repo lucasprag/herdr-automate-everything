@@ -76,3 +76,15 @@ pub fn ensure_state_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(locks_dir())?;
     Ok(())
 }
+
+/// This binary's path. On Linux, once the file is swapped for a new one
+/// (`service ensure` renames it into place) `/proc/self/exe` reads
+/// `<path> (deleted)`; the path itself is where the new binary is.
+pub fn current_exe() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    if let Some(p) = exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        return Ok(PathBuf::from(p));
+    }
+    Ok(exe)
+}
