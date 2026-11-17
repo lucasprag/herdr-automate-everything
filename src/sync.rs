@@ -223,7 +223,8 @@ pub fn send() -> Result<Vec<Outcome>> {
     let mut out = Vec::new();
     for m in machines {
         let text = copies.get(&m).cloned().unwrap_or_default();
-        let h = hash(&text);
+        // The sender's id counts: under a new one, the machine needs it again.
+        let h = hash(&format!("{source}\n{text}"));
         let last = sent.get(&m).cloned().unwrap_or_default();
         let due = last.at.map(|t| now - t > Duration::minutes(RESEND)).unwrap_or(true);
         if last.hash == h && last.error.is_none() && !due {
