@@ -81,8 +81,9 @@ The panel follows Orca's automations interface: a home page and a history page.
 37. **Copies follow changes**: right after a change from the CLI or the panel, and the scheduler checks every minute (and resends every half hour). An offline machine keeps its last copy and gets the new one when it's back. Dropping a machine from `runs_on` removes its copy. An empty timezone is written in as this Mac's.
 38. **Never hangs.** `--on <machine>` runs any CLI command there (`hc exec`); a machine hc doesn't show as connected fails at once, and calls time out (10 s for reads, 30 s for changes). `machines --probe` says which machines run automate-everything and with which version, remembering ones seen before so an offline one still shows.
 39. **One line per automation in the panel**, with where it runs and its last run wherever it was; Run now runs it everywhere. A machine that can't be reached, or hasn't got the latest copy, is said so on the line. Automations a machine defines itself show after, marked, and a name defined in both places is flagged.
-40. **Versions.** Copies need protocol 2 on the machine (`status --json` reports `version`, `protocol`, `timezone` and `source_id`); an older one is shown as needing an update. A field it doesn't know makes its copy invalid there, with the error.
-41. **Unchanged when nothing runs elsewhere:** no `runs_on`, no copies, no hc calls; the same panel as before.
+40. **Checked where it runs.** `check` asks each machine in a `runs_on` how it sees its copies and reports the ones it can't run; the panel shows the error on the automation's line.
+41. **Versions.** Copies need protocol 2 on the machine (`status --json` reports `version`, `protocol`, `timezone` and `source_id`); an older one is shown as needing an update. A field it doesn't know makes its copy invalid there, with the error.
+42. **Unchanged when nothing runs elsewhere:** no `runs_on`, no copies, no hc calls; the same panel as before.
 
 ## Out of scope
 

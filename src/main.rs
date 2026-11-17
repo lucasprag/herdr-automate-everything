@@ -602,6 +602,48 @@ fn check_machine(
     (errors, warnings)
 }
 
+/// The copies this machine sent, as each machine in a runs_on sees them: its
+/// paths and fields can only be judged there. Invalid ones, then machines
+/// that couldn't be asked.
+fn check_copies(
+    cfg: &config::Config,
+    listed: &Result<Vec<serde_json::Value>, String>,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let (mut invalid, mut warnings) = (Vec::new(), Vec::new());
+    let mut machines: Vec<String> = cfg
+        .valid()
+        .filter(|a| a.origin.is_none())
+        .flat_map(|a| a.runs_on())
+        .filter(|p| p != config::LOCAL)
+        .collect();
+    machines.sort();
+    machines.dedup();
+    let source = sync::source_id();
+    for m in machines {
+        let asked = match listed {
+            Ok(l) => remote::reachable_in(l, &m).and_then(|_| remote::call(&m, &["list".into(), "--json".into()])),
+            Err(e) => Err(anyhow!("{e}")),
+        };
+        let items: Vec<serde_json::Value> = match asked {
+            Ok(o) if o.ok() => serde_json::from_slice(&o.stdout).unwrap_or_default(),
+            Ok(o) => {
+                warnings.push(json!({ "name": m, "warning": format!("could not check its copies on `{m}`: {}", o.stderr_text()) }));
+                continue;
+            }
+            Err(e) => {
+                warnings.push(json!({ "name": m, "warning": format!("could not check its copies on `{m}`: {e:#}") }));
+                continue;
+            }
+        };
+        for i in items.iter().filter(|i| i["origin"].as_str() == Some(source.as_str())) {
+            if let Some(e) = i["error"].as_str() {
+                invalid.push(json!({ "name": i["name"], "error": format!("on `{m}`: {e}"), "machine": m }));
+            }
+        }
+    }
+    (invalid, warnings)
+}
+
 fn check(json_out: bool) -> Result<()> {
     let cfg = config::load()?;
     let mut invalid = Vec::new();
@@ -630,6 +672,9 @@ fn check(json_out: bool) -> Result<()> {
             }
         }
     }
+    let (bad, warns) = check_copies(&cfg, &listed);
+    invalid.extend(bad);
+    warnings.extend(warns);
     if json_out {
         println!(
             "{}",

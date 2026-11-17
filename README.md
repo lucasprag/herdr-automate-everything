@@ -329,6 +329,10 @@ command = "uname -a; hostname"
   schedule means the same on every machine.
 - **Run now** runs it everywhere it runs; `run --wait` needs a single place
   (add `--on lab` for one machine).
+- **Checking it:** a copy's paths and fields are judged on the machine, so
+  `automate-everything check` asks each machine in a `runs_on` and reports
+  copies it can't run (`on `lab`: repo ... is not a folder`); the panel says
+  so on the automation's line.
 - **A name in the machine's own config** wins over the copy; the copy shows as
   invalid there until one of them goes.
 

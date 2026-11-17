@@ -226,7 +226,8 @@ export class Panel {
           ? `automate-everything on ${place} is too old to run this: update it there`
           : r.reachable === false
             ? `${place} is unreachable: it runs this from the last copy it got`
-            : r.items && !copy ? `Not on ${place} yet: it's sent within a minute` : null;
+            : r.items && !copy ? `Not on ${place} yet: it's sent within a minute`
+              : copy?.error ? `Can't run on ${place}: ${copy.error}` : null;
       return { place, item: copy ?? null, problem };
     });
   }
