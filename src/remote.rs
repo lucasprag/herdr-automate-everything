@@ -104,7 +104,7 @@ pub fn call(machine: &str, args: &[String]) -> Result<hc::ExecOut> {
 /// here and its exit code returned.
 pub fn proxy(machine: &str, args: &[String]) -> Result<i32> {
     reachable(machine)?;
-    if subcommand(args) == "run" && !args.iter().any(|a| a == "--wait") {
+    if subcommand(args) == "run" && !args.iter().any(|a| a == "--wait" || a == "--check") {
         return run_detached(machine, args);
     }
     let out = call(machine, args)?;
