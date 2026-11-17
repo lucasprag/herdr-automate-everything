@@ -72,6 +72,10 @@ pub struct Entry {
     pub env: Option<BTreeMap<String, String>>,
     /// An hc machine (`hc machine ls`) the run executes on; unset = this Mac.
     pub machine: Option<String>,
+    /// Where it's scheduled and run: `local` (this machine's scheduler) and/or
+    /// machines running automate-everything, each of which gets a copy and
+    /// fires it itself. Unset = `["local"]`.
+    pub runs_on: Option<Vec<String>>,
 
     // script
     pub command: Option<String>,
@@ -99,6 +103,9 @@ pub struct Automation {
     pub kind: Kind,
     pub cron: Cron,
     pub tz: Tz,
+    /// Set on a copy another machine sent (`sync`): that machine's id. It's
+    /// defined, and changed, there.
+    pub origin: Option<String>,
 }
 
 impl Automation {
@@ -143,6 +150,14 @@ impl Automation {
     pub fn machine(&self) -> Option<&str> {
         self.entry.machine.as_deref()
     }
+    /// Where it runs: `local` and/or machines (see `Entry::runs_on`).
+    pub fn runs_on(&self) -> Vec<String> {
+        runs_on_of(&self.entry.runs_on)
+    }
+    /// Whether this machine's scheduler fires it.
+    pub fn runs_here(&self) -> bool {
+        self.runs_on().iter().any(|p| p == LOCAL)
+    }
     /// The repo, on the machine it runs on.
     pub fn repo(&self, host: &Host) -> Option<PathBuf> {
         self.entry.repo.as_deref().map(|r| host.expand(r))
@@ -170,6 +185,17 @@ pub struct Invalid {
     pub schedule: Option<String>,
     pub machine: Option<String>,
     pub paused: bool,
+    pub origin: Option<String>,
+}
+
+/// In `runs_on`: this machine.
+pub const LOCAL: &str = "local";
+
+pub fn runs_on_of(v: &Option<Vec<String>>) -> Vec<String> {
+    match v {
+        Some(v) if !v.is_empty() => v.clone(),
+        _ => vec![LOCAL.to_string()],
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +209,13 @@ impl Slot {
         match self {
             Slot::Valid(a) => &a.name,
             Slot::Invalid(i) => &i.name,
+        }
+    }
+    /// The machine that sent this copy; None for an entry of this machine's config.
+    pub fn origin(&self) -> Option<&str> {
+        match self {
+            Slot::Valid(a) => a.origin.as_deref(),
+            Slot::Invalid(i) => i.origin.as_deref(),
         }
     }
 }
@@ -232,7 +265,7 @@ const SCRIPT_ONLY: &[&str] = &["command", "cwd"];
 
 /// The order new fields are written in.
 const FIELD_ORDER: &[&str] = &[
-    "kind", "description", "schedule", "timezone", "grace_minutes", "paused", "machine", "command", "cwd", "agent",
+    "kind", "description", "schedule", "timezone", "grace_minutes", "paused", "runs_on", "machine", "command", "cwd", "agent",
     "model", "agent_args", "repo", "directory", "base_branch", "space", "space_name", "prompt", "prompt_file",
     "precheck", "precheck_timeout_seconds", "timeout_seconds", "env",
 ];
@@ -272,8 +305,27 @@ pub fn validate(name: &str, entry: Entry) -> Result<Automation> {
             bail!("machine `{m}` is not a machine name (see `hc machine ls`)");
         }
     }
+    let places = runs_on_of(&entry.runs_on);
+    if entry.runs_on.as_ref().is_some_and(|v| v.is_empty()) {
+        bail!("`runs_on` is empty: list `local` and/or machines");
+    }
+    for (i, p) in places.iter().enumerate() {
+        if p != LOCAL && !valid_machine(p) {
+            bail!("runs_on: `{p}` is not `local` or a machine name (see `hc machine ls`)");
+        }
+        if places[..i].contains(p) {
+            bail!("runs_on lists `{p}` twice");
+        }
+    }
+    let here = places.iter().any(|p| p == LOCAL);
+    if entry.machine.is_some() && places.len() > 1 {
+        bail!("`machine` (this machine fires it, it runs there) only goes with runs_on = [\"local\"]");
+    }
+    if entry.machine.is_some() && !here {
+        bail!("`machine` and runs_on without `local`: list the machine in runs_on instead");
+    }
     // Paths on another machine can only be checked there (`check` does).
-    let local = entry.machine.is_none();
+    let local = entry.machine.is_none() && here;
     let fields = set_fields(&entry);
     match kind {
         Kind::Script => {
@@ -320,7 +372,7 @@ pub fn validate(name: &str, entry: Entry) -> Result<Automation> {
             }
         }
     }
-    Ok(Automation { name: name.to_string(), entry, kind, cron, tz })
+    Ok(Automation { name: name.to_string(), entry, kind, cron, tz, origin: None })
 }
 
 fn str_field(v: &toml::Value, key: &str) -> Option<String> {
@@ -358,6 +410,7 @@ pub fn parse(text: &str) -> Result<Config> {
                     schedule: str_field(value, "schedule"),
                     machine: str_field(value, "machine"),
                     paused,
+                    origin: None,
                 }),
             });
         }
@@ -374,8 +427,39 @@ pub fn read_text() -> Result<String> {
     }
 }
 
+/// This machine's config plus the copies other machines sent it (`sync`).
 pub fn load() -> Result<Config> {
-    parse(&read_text()?)
+    let mut cfg = parse(&read_text()?)?;
+    for (origin, text) in crate::sync::received() {
+        let theirs = match parse(&text) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::scheduler::log(&format!("ignoring the copy from `{origin}`: {e:#}"));
+                continue;
+            }
+        };
+        for mut slot in theirs.slots {
+            if cfg.find(slot.name()).is_some() {
+                // This machine's own entry wins; the copy shows why it doesn't run.
+                let name = slot.name().to_string();
+                slot = Slot::Invalid(Invalid {
+                    error: format!("this machine's own config also has `{name}`: remove one of them"),
+                    name,
+                    kind: None,
+                    schedule: None,
+                    machine: None,
+                    paused: false,
+                    origin: None,
+                });
+            }
+            match &mut slot {
+                Slot::Valid(a) => a.origin = Some(origin.clone()),
+                Slot::Invalid(i) => i.origin = Some(origin.clone()),
+            }
+            cfg.slots.push(slot);
+        }
+    }
+    Ok(cfg)
 }
 
 const HEADER: &str = "\
@@ -582,6 +666,26 @@ mod tests {
         let order: Vec<_> = doc["automations"].as_table().unwrap().iter().map(|(k, _)| k.to_string()).collect();
         assert_eq!(order, ["a", "b", "c"]);
         assert!(doc.to_string().ends_with("# about c\n[automations.c]\nkind = \"script\"\n"));
+    }
+
+    #[test]
+    fn runs_on_lists_local_and_machines() {
+        let entry = |extra: &str| {
+            let text = format!("[automations.x]\nkind = \"script\"\nschedule = \"* * * * *\"\ncommand = \"true\"\n{extra}");
+            match parse(&text).unwrap().slots.remove(0) {
+                Slot::Valid(a) => Ok((a.runs_on(), a.runs_here())),
+                Slot::Invalid(i) => Err(i.error),
+            }
+        };
+        assert_eq!(entry("").unwrap(), (vec!["local".to_string()], true));
+        assert_eq!(entry("runs_on = [\"lab\"]").unwrap(), (vec!["lab".to_string()], false));
+        assert!(entry("runs_on = [\"local\", \"lab\"]").unwrap().1);
+        assert!(entry("runs_on = []").unwrap_err().contains("empty"));
+        assert!(entry("runs_on = [\"lab\", \"lab\"]").unwrap_err().contains("twice"));
+        assert!(entry("runs_on = [\"a/b\"]").unwrap_err().contains("not `local`"));
+        // `machine` is this machine firing a run elsewhere: only with local alone.
+        assert!(entry("runs_on = [\"lab\"]\nmachine = \"lab\"").is_err());
+        assert!(entry("runs_on = [\"local\"]\nmachine = \"lab\"").is_ok());
     }
 
     #[test]

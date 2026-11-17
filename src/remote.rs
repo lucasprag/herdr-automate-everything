@@ -18,9 +18,10 @@ use serde_json::{json, Value};
 
 use crate::{hc, history};
 
-/// What `--on` needs from the other side; reported by `status --json` as
-/// `protocol`. Older builds report none (0).
-pub const PROTOCOL: u64 = 1;
+/// What `--on` and `runs_on` need from the other side; reported by `status
+/// --json` as `protocol`. Older builds report none (0); 2 receives copies
+/// (`_sync-in`).
+pub const PROTOCOL: u64 = 2;
 
 /// Exit code of `WRAP` when the machine has no automate-everything.
 const NOT_INSTALLED: i32 = 127;
@@ -126,28 +127,35 @@ fn run_detached(machine: &str, args: &[String]) -> Result<i32> {
         .find(|a| !a.starts_with('-'))
         .ok_or_else(|| anyhow!("run: which automation?"))?
         .clone();
-    let check = call(machine, &["run".into(), name.clone(), "--check".into()])?;
+    let run_id = start_run(machine, &name)?;
+    if json_out {
+        println!("{}", json!({ "run_id": run_id, "runs": [{ "on": machine, "run_id": run_id }] }));
+    } else {
+        println!("started {name} on {machine} ({run_id})");
+    }
+    Ok(0)
+}
+
+/// Starts `name` on `machine` (its own entry there, or the copy it was
+/// sent), not waiting for it; its run id.
+pub fn start_run(machine: &str, name: &str) -> Result<String> {
+    let check = call(machine, &["run".into(), name.into(), "--check".into()])?;
     if !check.ok() {
         bail!("{}", check.stderr_text().trim_start_matches("Error: "));
     }
-    let run_id = history::new_id(&name);
+    let run_id = history::new_id(name);
     let mut argv: Vec<String> = ["/bin/sh", "-c", WRAP, "sh", "run"].iter().map(|s| s.to_string()).collect();
-    argv.extend([name.clone(), "--wait".into(), "--run-id".into(), run_id.clone()]);
+    argv.extend([name.to_string(), "--wait".into(), "--here".into(), "--run-id".into(), run_id.clone()]);
     hc::launch(&hc::Launch {
         on: Some(machine),
         cwd: "/",
-        labels: vec![("automation".into(), name.clone())],
+        labels: vec![("automation".into(), name.to_string())],
         argv,
         keep: false,
         rm: true,
     })
     .map_err(|e| anyhow!("machine `{machine}` unreachable: {e:#}"))?;
-    if json_out {
-        println!("{}", json!({ "run_id": run_id }));
-    } else {
-        println!("started {name} on {machine} ({run_id})");
-    }
-    Ok(0)
+    Ok(run_id)
 }
 
 /// What `machine` runs: `installed`, and when it is, its `version`,

@@ -90,7 +90,8 @@ fn tick(st: &mut State) {
     for a in cfg.valid() {
         let cursor = *st.cursors.entry(a.name.clone()).or_insert(now);
         st.cursors.insert(a.name.clone(), now);
-        if a.paused() {
+        // Only on other machines (`runs_on`): they fire their own copies.
+        if a.paused() || !a.runs_here() {
             continue;
         }
         let from = cursor.max(now - Duration::days(MAX_LOOKBACK_DAYS));
@@ -173,8 +174,30 @@ pub fn serve() -> Result<()> {
     let mut st = State { cursors: load_cursors(), reported: HashMap::new(), config_error: None };
     let mut last_prune: Option<DateTime<Utc>> = None;
 
+    // Copies for other machines go out on a thread of their own, so a slow
+    // machine never holds up a fire.
+    let sending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     loop {
         tick(&mut st);
+
+        if !sending.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let sending = sending.clone();
+            std::thread::spawn(move || {
+                match crate::sync::send() {
+                    Ok(outcomes) => {
+                        for o in outcomes {
+                            match o.result {
+                                Some(Ok(n)) => log(&format!("sent `{}` its {n} automations", o.machine)),
+                                Some(Err(e)) => log(&format!("could not send `{}` its automations: {e:#}", o.machine)),
+                                None => {}
+                            }
+                        }
+                    }
+                    Err(e) => log(&format!("could not work out what to send other machines: {e:#}")),
+                }
+                sending.store(false, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
 
         if last_prune.map(|t| Utc::now() - t > Duration::hours(1)).unwrap_or(true) {
             if let Ok(cfg) = config::load() {

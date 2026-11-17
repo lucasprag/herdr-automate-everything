@@ -12,8 +12,8 @@ mod remote;
 mod runner;
 mod scheduler;
 mod service;
+mod sync;
 mod tabs;
-mod transfer;
 
 use std::io::IsTerminal;
 
@@ -57,6 +57,9 @@ enum Cmd {
         /// Only check it could run, start nothing (for `--on`)
         #[arg(long, hide = true)]
         check: bool,
+        /// Run it on this machine only, whatever its runs_on
+        #[arg(long, hide = true)]
+        here: bool,
     },
     /// Stop scheduling it, keeping the entry
     Pause { name: String },
@@ -69,7 +72,8 @@ enum Cmd {
         #[arg(long)]
         to: usize,
     },
-    /// Remove the entry from the config and delete its history
+    /// Remove the entry from the config and delete its history (here; a
+    /// machine in its runs_on keeps its own)
     Delete {
         name: String,
         #[arg(long)]
@@ -77,19 +81,6 @@ enum Cmd {
         /// Remove only the entry, keeping its run history
         #[arg(long)]
         keep_history: bool,
-    },
-    /// Hand the entry to another scheduler: `--to <machine>` makes that
-    /// machine keep the schedule and fire it (even while this one sleeps),
-    /// `--to here` brings it back. With `--on`, the entry comes from there.
-    /// Its history stays where it was.
-    Transfer {
-        name: String,
-        /// A machine (`hc machine ls`), or `here` for this one
-        #[arg(long)]
-        to: String,
-        /// JSON object of fields to change on the way (as for `set`)
-        #[arg(long)]
-        fields: Option<String>,
     },
     /// Runs and skips, newest first
     History {
@@ -149,6 +140,15 @@ enum Cmd {
     },
     /// Run the scheduler in the foreground (the background service does this)
     Scheduler,
+    /// Replaces the automations another machine sent this one (its
+    /// `runs_on`); the scheduler here fires them
+    #[command(name = "_sync-in", hide = true)]
+    SyncIn {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        toml: String,
+    },
     #[command(name = "_run", hide = true)]
     RunInternal {
         name: String,
@@ -222,12 +222,14 @@ fn list(json_out: bool) -> Result<()> {
                     "name": name, "kind": a.kind.as_str(), "status": status, "paused": a.paused(),
                     "schedule": a.entry.schedule, "timezone": a.tz.name(), "description": a.entry.description,
                     "grace_minutes": a.grace_minutes(), "machine": a.machine(), "error": null,
+                    "runs_on": a.runs_on(), "origin": a.origin,
                     "next": next, "last": last, "live": live,
                 })
             }
             Slot::Invalid(i) => json!({
                 "name": name, "kind": i.kind, "status": if running { "running" } else { "invalid" }, "paused": i.paused,
                 "schedule": i.schedule, "timezone": null, "description": null, "machine": i.machine, "error": i.error,
+                "runs_on": null, "origin": i.origin,
                 "next": null, "last": last, "live": live,
             }),
         };
@@ -242,13 +244,21 @@ fn list(json_out: bool) -> Result<()> {
         return Ok(());
     }
     let w = items.iter().map(|i| i["name"].as_str().unwrap_or("").len()).max().unwrap_or(4).max(4);
-    // The MACHINE column only shows once some entry runs elsewhere.
-    let mw = items.iter().filter_map(|i| i["machine"].as_str()).map(str::len).max().map(|n| n.max(7));
+    // The WHERE column only shows once some entry runs elsewhere: its
+    // machine (fired from here), or its runs_on.
+    let place = |i: &serde_json::Value| -> Option<String> {
+        if let Some(m) = i["machine"].as_str() {
+            return Some(format!("{m} (via here)"));
+        }
+        let places: Vec<&str> = i["runs_on"].as_array()?.iter().filter_map(|p| p.as_str()).collect();
+        (places != [config::LOCAL]).then(|| places.join(","))
+    };
+    let mw = items.iter().filter_map(place).map(|p| p.len()).max().map(|n| n.max(5));
     let on = |i: &serde_json::Value| match mw {
-        Some(mw) => format!("{:mw$}  ", i["machine"].as_str().unwrap_or("-")),
+        Some(mw) => format!("{:mw$}  ", place(i).unwrap_or_else(|| "local".into())),
         None => String::new(),
     };
-    let header = mw.map(|mw| format!("{:mw$}  ", "MACHINE")).unwrap_or_default();
+    let header = mw.map(|mw| format!("{:mw$}  ", "WHERE")).unwrap_or_default();
     println!("{:w$}  {:6}  {header}{:8}  {:34}  {}", "NAME", "KIND", "STATUS", "LAST RUN", "NEXT RUN");
     for i in &items {
         let last = match i["last"].as_object() {
@@ -281,14 +291,66 @@ fn list(json_out: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_now(name: &str, wait: bool, json_out: bool, run_id: Option<String>, check_only: bool) -> Result<()> {
+/// Run now, wherever it runs (`runs_on`): here in the background (or
+/// waiting, with `--wait`), and on each machine in a terminal there.
+fn run_now(name: &str, wait: bool, json_out: bool, run_id: Option<String>, check_only: bool, here: bool) -> Result<()> {
     let cfg = config::load()?;
-    match cfg.find(name) {
+    let places = match cfg.find(name) {
         None => bail!("no automation named `{name}`"),
         Some(Slot::Invalid(i)) => bail!("`{name}` is invalid: {}", i.error),
-        Some(Slot::Valid(_)) => {}
-    }
+        Some(Slot::Valid(a)) => a.runs_on(),
+    };
     if check_only {
+        return Ok(());
+    }
+    let machines: Vec<&String> = if here { Vec::new() } else { places.iter().filter(|p| *p != config::LOCAL).collect() };
+    let local = here || places.iter().any(|p| p == config::LOCAL);
+    if !machines.is_empty() {
+        if wait {
+            match (local, machines.as_slice()) {
+                (false, [m]) => {
+                    let args: Vec<String> = ["run", name, "--wait"].iter().map(|s| s.to_string()).chain(json_out.then(|| "--json".to_string())).collect();
+                    std::process::exit(remote::proxy(m, &args)?);
+                }
+                _ => bail!("`{name}` runs in more than one place; --wait needs one: add --on <machine>, or run it without --wait"),
+            }
+        }
+        let mut runs = Vec::new();
+        let mut errors = Vec::new();
+        if local {
+            let req = runner::Request {
+                name: name.to_string(),
+                trigger: Trigger::Manual,
+                run_id: run_id.clone().unwrap_or_else(|| history::new_id(name)),
+                scheduled_for: None,
+                caught_up: None,
+            };
+            paths::ensure_state_dirs()?;
+            let mut child = runner::spawn(&req)?;
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let _ = child.try_wait();
+            runs.push(json!({ "on": null, "run_id": req.run_id }));
+        }
+        for m in machines {
+            match remote::reachable(m).and_then(|_| remote::start_run(m, name)) {
+                Ok(id) => runs.push(json!({ "on": m, "run_id": id })),
+                Err(e) => errors.push(format!("{m}: {e:#}")),
+            }
+        }
+        if runs.is_empty() {
+            bail!("{}", errors.join("; "));
+        }
+        if json_out {
+            println!("{}", json!({ "run_id": runs[0]["run_id"], "runs": runs, "errors": errors }));
+        } else {
+            for r in &runs {
+                let on = r["on"].as_str().map(|m| format!(" on {m}")).unwrap_or_default();
+                println!("started {name}{on} ({})", r["run_id"].as_str().unwrap_or(""));
+            }
+            for e in &errors {
+                eprintln!("not started on {e}");
+            }
+        }
         return Ok(());
     }
     let req = runner::Request {
@@ -539,7 +601,8 @@ fn check(json_out: bool) -> Result<()> {
     let mut invalid = Vec::new();
     let mut warnings = Vec::new();
     // Asked once, and only when some entry runs elsewhere.
-    let listed = if cfg.valid().any(|a| a.machine().is_some()) {
+    let elsewhere = |a: &config::Automation| a.machine().is_some() || !a.runs_here() || a.runs_on().len() > 1;
+    let listed = if cfg.valid().any(elsewhere) {
         hc::machines().map_err(|e| format!("{e:#}"))
     } else {
         Ok(Vec::new())
@@ -548,7 +611,14 @@ fn check(json_out: bool) -> Result<()> {
         match s {
             Slot::Invalid(i) => invalid.push(json!({ "name": i.name, "error": i.error })),
             Slot::Valid(a) => {
-                let (errors, warns) = check_machine(a, &listed);
+                let (mut errors, mut warns) = check_machine(a, &listed);
+                for m in a.runs_on().iter().filter(|p| *p != config::LOCAL) {
+                    match machine_known(m, &listed) {
+                        Err(e) => errors.push(format!("runs_on: {e:#}")),
+                        Ok(Some(w)) => warns.push(format!("runs_on: {w}")),
+                        Ok(None) => {}
+                    }
+                }
                 invalid.extend(errors.iter().map(|e| json!({ "name": a.name, "error": e })));
                 warnings.extend(warns.iter().map(|w| json!({ "name": a.name, "warning": w })));
             }
@@ -660,6 +730,15 @@ fn remember_machines(v: &mut [serde_json::Value]) {
     }
 }
 
+/// Changes go to where an automation is defined: a copy another machine sent
+/// is changed there.
+fn not_a_copy(name: &str) -> Result<()> {
+    if let Some(origin) = config::load()?.find(name).and_then(|s| s.origin().map(String::from)) {
+        bail!("`{name}` is defined on `{origin}`, which sends it here: change it there");
+    }
+    Ok(())
+}
+
 fn status(json_out: bool) -> Result<()> {
     let running = lock::is_held(&paths::scheduler_lock());
     let note = lock::read_note(&paths::scheduler_lock());
@@ -670,6 +749,8 @@ fn status(json_out: bool) -> Result<()> {
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": remote::PROTOCOL,
         "timezone": cron::system_tz().name(),
+        "source_id": sync::source_id(),
+        "sent": sync::sent_status(),
         "config": paths::config_file(),
         "state": paths::state_dir(),
         "log": paths::scheduler_log(),
@@ -697,9 +778,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Some(m) = &cli.on {
         match &cli.cmd {
-            // Moves between here and there: done from here.
-            Cmd::Transfer { .. } => {}
-            Cmd::Scheduler | Cmd::RunInternal { .. } => bail!("--on doesn't apply to this command"),
+            Cmd::Scheduler | Cmd::RunInternal { .. } | Cmd::SyncIn { .. } => bail!("--on doesn't apply to this command"),
             _ => {
                 let args = remote::strip_on(std::env::args().skip(1), m);
                 std::process::exit(remote::proxy(m, &args)?);
@@ -708,23 +787,29 @@ fn main() -> Result<()> {
     }
     match cli.cmd {
         Cmd::List { json } => list(json),
-        Cmd::Run { name, wait, json, run_id, check } => run_now(&name, wait, json, run_id, check),
+        Cmd::Run { name, wait, json, run_id, check, here } => run_now(&name, wait, json, run_id, check, here),
         Cmd::Pause { name } => {
+            not_a_copy(&name)?;
             config::set_paused(&name, true)?;
             println!("paused {name}");
+            sync::send_and_report();
             Ok(())
         }
         Cmd::Resume { name } => {
+            not_a_copy(&name)?;
             config::set_paused(&name, false)?;
             println!("resumed {name}");
+            sync::send_and_report();
             Ok(())
         }
         Cmd::Move { name, to } => {
+            not_a_copy(&name)?;
             config::move_to(&name, to)?;
             println!("moved {name} to {to}");
             Ok(())
         }
         Cmd::Delete { name, yes, keep_history } => {
+            not_a_copy(&name)?;
             let what = if keep_history { "" } else { " and its run history" };
             if !yes && !confirm(&format!("Delete `{name}`{what}?")) {
                 bail!("not deleted (pass --yes to skip the question)");
@@ -736,22 +821,7 @@ fn main() -> Result<()> {
                 let n = history::delete_for(&name);
                 println!("deleted {name} and {n} history records");
             }
-            Ok(())
-        }
-        Cmd::Transfer { name, to, fields } => {
-            let fields: Option<serde_json::Value> =
-                fields.map(|f| serde_json::from_str(&f)).transpose().context("--fields must be a JSON object")?;
-            let fields = match &fields {
-                Some(v) => Some(v.as_object().ok_or_else(|| anyhow!("--fields must be a JSON object"))?),
-                None => None,
-            };
-            let from = cli.on.as_deref().map(transfer::Side::parse).unwrap_or(transfer::Side::Here);
-            let to = transfer::Side::parse(&to);
-            transfer::transfer(&name, from, to.clone(), fields)?;
-            match to {
-                transfer::Side::Here => println!("{name} is now scheduled by this machine"),
-                transfer::Side::On(m) => println!("{name} is now scheduled by {m}"),
-            }
+            sync::send_and_report();
             Ok(())
         }
         Cmd::History { name, limit, json } => history_cmd(name, limit, json),
@@ -770,15 +840,22 @@ fn main() -> Result<()> {
         Cmd::Set { name, fields, create } => {
             let v: serde_json::Value = serde_json::from_str(&fields).context("--fields must be a JSON object")?;
             let obj = v.as_object().ok_or_else(|| anyhow!("--fields must be a JSON object"))?;
-            if let Some(m) = obj.get("machine").and_then(|m| m.as_str()) {
-                if config::valid_machine(m) {
-                    if let Some(w) = machine_known(m, &hc::machines().map_err(|e| format!("{e:#}")))? {
+            let mut named: Vec<&str> = obj.get("machine").and_then(|m| m.as_str()).into_iter().collect();
+            if let Some(places) = obj.get("runs_on").and_then(|v| v.as_array()) {
+                named.extend(places.iter().filter_map(|p| p.as_str()).filter(|p| *p != config::LOCAL));
+            }
+            if named.iter().any(|m| config::valid_machine(m)) {
+                let listed = hc::machines().map_err(|e| format!("{e:#}"));
+                for m in named.iter().filter(|m| config::valid_machine(m)) {
+                    if let Some(w) = machine_known(m, &listed)? {
                         eprintln!("warning: {w}");
                     }
                 }
             }
+            not_a_copy(&name)?;
             config::upsert(&name, obj, create)?;
             println!("saved {name}");
+            sync::send_and_report();
             Ok(())
         }
         Cmd::Check { json } => check(json),
@@ -787,6 +864,10 @@ fn main() -> Result<()> {
         Cmd::Service { action } => service::run(action),
         Cmd::Tab { action } => tabs::run(action),
         Cmd::Scheduler => scheduler::serve(),
+        Cmd::SyncIn { from, toml } => {
+            println!("{}", sync::receive(&from, &toml)?);
+            Ok(())
+        }
         Cmd::RunInternal { name, run_id, trigger, scheduled_for, caught_up } => {
             let trigger = match trigger.as_str() {
                 "scheduled" => Trigger::Scheduled,
